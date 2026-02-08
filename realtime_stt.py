@@ -107,8 +107,8 @@ class StreamingSTT:
             )
         except Exception:
             return
-        # Read in larger chunks so the decoder has more context (better word recognition)
-        chunk_samples = 4000
+        # Small chunks = partials very often = minimal delay (best for real-time)
+        chunk_samples = 1200
         while self.running and stream.is_active():
             try:
                 data = stream.read(chunk_samples, exception_on_overflow=False)

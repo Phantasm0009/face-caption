@@ -7,6 +7,7 @@ Face-following captions: subtitles anchored near your face that follow you.
 
 import cv2
 import numpy as np
+import re
 import threading
 import queue
 import time
@@ -39,10 +40,13 @@ FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 CAMERA_RESOLUTIONS = [(1280, 720), (1920, 1080), (960, 540), (0, 0)]
 # Max size we process/show (if camera is larger, we resize to this = less lag)
 DISPLAY_SIZE = (1280, 720)
-# Face: every 2nd frame + fast resize to keep stream smooth
-FACE_DETECT_SCALE = 0.4
+# Face: stick to your head (smoother = less "running away")
+FACE_DETECT_SCALE = 0.45
 FACE_DETECT_EVERY_N = 1
-FACE_SMOOTH = 0.55
+FACE_SMOOTH = 0.28
+MAX_CAPTION_LINES = 2
+# Real-time: show full text immediately (no reveal delay). Set to 3–5 for smooth type-in effect.
+REVEAL_CHARS_PER_FRAME = 999  # 999 = no delay; lower = smoother type-in, more delay
 # Minecraft-style chat background
 CAPTION_BG_COLOR = (30, 30, 30, 200)
 CAPTION_BG_PADDING = 12  # Slightly more padding for larger text
@@ -103,11 +107,14 @@ def _wrap_text(text: str, font, max_width: int) -> list:
 
 
 def render_caption_pil(text: str, font_size: int, font_path: str = None) -> np.ndarray:
-    """Render text with Minecraft font and semi-transparent dark background (BGRA)."""
+    """Render text in 2 lines; when text overflows, show last 2 lines with newest on bottom."""
     if not text or not HAS_PIL:
         return None
     font = get_minecraft_font(font_size)
     lines = _wrap_text(text, font, CAPTION_MAX_WIDTH)
+    # When past 2 lines: show last 2 lines only — top = older, bottom = newest
+    if len(lines) > MAX_CAPTION_LINES:
+        lines = lines[-MAX_CAPTION_LINES:]  # [older, newest]; display in that order
     line_height = font_size + 4
     pad = CAPTION_BG_PADDING
     # Measure actual text width (max line width)
@@ -234,10 +241,11 @@ def main():
     else:
         print("Speech: install speech_recognition and PyAudio (and optionally vosk for real-time)")
 
-    # Caption: show only current content (no old + new). Partial while speaking, single last final when done.
+    # Caption: show only current content; smooth reveal so text flows in
     live_partial = ""
-    last_final = ""  # single most recent phrase only (replaced on new final)
+    last_final = ""
     current_caption = ""
+    reveal_len = 0  # Smooth type-in: show this many chars, increases each frame
     emotion_estimator = EmotionEstimator()
     emotion = "neutral"
     last_caption_render = None
@@ -275,14 +283,25 @@ def main():
             gray_small = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
             faces = face_cascade.detectMultiScale(
                 gray_small,
-                scaleFactor=1.15,
-                minNeighbors=4,
-                minSize=(20, 20),
+                scaleFactor=1.12,
+                minNeighbors=5,
+                minSize=(24, 24),
             )
             if len(faces) > 0:
-                x_f, y_f, bw, bh = faces[0]
-                # Scale bbox back to full frame
                 scale_x, scale_y = w / small_w, h / small_h
+                # Pick the face closest to current caption position (so it doesn't "run away" to another face)
+                best = 0
+                best_dist = float("inf")
+                for i, (fx, fy, fw, fh) in enumerate(faces):
+                    cx_scaled = fx + fw / 2
+                    cy_scaled = fy
+                    dx = (cx_scaled * scale_x) - face_center_x
+                    dy = (cy_scaled * scale_y) - face_top_y
+                    d = dx * dx + dy * dy
+                    if d < best_dist:
+                        best_dist = d
+                        best = i
+                x_f, y_f, bw, bh = faces[best]
                 x_f = int(x_f * scale_x)
                 y_f = int(y_f * scale_y)
                 bw = int(bw * scale_x)
@@ -290,6 +309,7 @@ def main():
                 last_face_bbox = (x_f, y_f, bw, bh)
                 new_cx = x_f + bw / 2
                 new_ty = float(y_f)
+                # Stick to head: smooth blend so caption doesn't jump or drift
                 face_center_x = face_center_x + FACE_SMOOTH * (new_cx - face_center_x)
                 face_top_y = face_top_y + FACE_SMOOTH * (new_ty - face_top_y)
             else:
@@ -315,14 +335,25 @@ def main():
             pass
         # Show only current: live words while speaking, or the single phrase you just said
         current_caption = live_partial if live_partial else last_final
+        # Remove placeholders and square/box chars (recognizer artifacts or missing glyphs)
+        current_caption = re.sub(r"\s*\[\s*\]\s*", " ", current_caption)
+        current_caption = re.sub(r"[\u25A0-\u25AB\u25FB\u25FC\uFFFD]", "", current_caption)  # □ ■ ▢ etc.
+        current_caption = re.sub(r"\s+", " ", current_caption).strip()
         if len(current_caption) > MAX_CAPTION_LEN:
             current_caption = current_caption[-MAX_CAPTION_LEN:].strip()
 
-        # Build display line: emoji + caption
-        emoji, _ = EMOTIONS.get(emotion, EMOTIONS["neutral"])
-        display_text = f"{emoji} {current_caption}" if current_caption else emoji
+        # Smooth reveal: when caption shrinks (new phrase), reset; else reveal more chars each frame
+        target_len = len(current_caption)
+        if target_len < reveal_len:
+            reveal_len = target_len
+        else:
+            reveal_len = min(reveal_len + REVEAL_CHARS_PER_FRAME, target_len)
+        displayed_caption = current_caption[:reveal_len]
+
+        # Show only the words (no emoji prefix — Minecraft font has no emoji, so it drew a box)
+        display_text = displayed_caption if displayed_caption else ""
         if not display_text.strip():
-            display_text = emoji
+            display_text = "..."
 
         if display_text != last_caption_text or last_caption_render is None:
             last_caption_render = render_caption_pil(display_text, CAPTION_FONT_SIZE)
