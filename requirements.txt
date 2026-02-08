@@ -9,5 +9,14 @@ Pillow>=10.0.0
 numpy>=1.24.0
 vosk>=0.3.45
 
+# Optional: better accuracy than Vosk (pip install faster-whisper)
+# faster-whisper
+
 # Optional: live translation (press M in app)
 # googletrans==4.0.0-rc1
+
+# Optional: load .env for DEEPGRAM_API_KEY etc.
+python-dotenv>=1.0.0
+
+# Optional: best quality cloud STT (set DEEPGRAM_API_KEY in .env)
+# deepgram-sdk

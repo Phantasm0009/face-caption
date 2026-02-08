@@ -14,6 +14,14 @@ import time
 import os
 import sys
 
+# Load .env so DEEPGRAM_API_KEY (and others) are set before STT starts
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(_env_path)
+except ImportError:
+    pass
+
 # Real-time speech: use project library (streaming when possible)
 try:
     from realtime_stt import StreamingSTT, RESULT_FINAL, RESULT_PARTIAL, get_caption_mode
@@ -59,17 +67,17 @@ CAPTION_MAX_WIDTH = 580
 # Gap between bottom of caption box and top of head (larger = caption sits well above head)
 CAPTION_OFFSET_ABOVE_HEAD = 55
 MAX_CAPTION_LEN = 100
-# Captions disappear after this many seconds of no new content
-CAPTION_TIMEOUT_SEC = 5.0
+# Captions disappear after this many seconds of no new content (lower = less clutter)
+CAPTION_TIMEOUT_SEC = 3.0
 EMOTION_SMOOTH = 0.3
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 # Prefer 720p capture = smooth stream (no heavy 1080p resize every frame)
 CAMERA_RESOLUTIONS = [(1280, 720), (1920, 1080), (960, 540), (0, 0)]
 # Max size we process/show (if camera is larger, we resize to this = less lag)
 DISPLAY_SIZE = (1280, 720)
-# Face: stick to your head (smoother = less "running away")
-FACE_DETECT_SCALE = 0.45
-FACE_DETECT_EVERY_N = 1
+# Face: smaller scale = faster detection; every Nth frame = smoother video
+FACE_DETECT_SCALE = 0.35
+FACE_DETECT_EVERY_N = 3
 FACE_SMOOTH = 0.28
 MAX_CAPTION_LINES = 2
 # Instant captions: show text as soon as it’s said (999 = no typewriter delay)
@@ -101,7 +109,7 @@ EMOTION_COLORS = {
 SHOW_FACE_BOX = False              # Set True to draw green face outline
 SPEECH_BUBBLE_TAIL = True         # Draw a tail on the caption box pointing to head
 CAPTION_HISTORY_LINES = 2         # Exactly 2 lines: top = oldest, bottom = newest (real-time)
-FADE_IN_FRAMES = 1                # Snappy fade (1–2 = instant feel; 0 = no fade)
+FADE_IN_FRAMES = 0                # 0 = instant appearance (no fade); 1–4 = snappy fade
 # Emotion: require this many consecutive frames before switching (reduces jitter)
 EMOTION_HOLD_FRAMES = 3
 # Translation (optional): pip install googletrans==4.0.0-rc1
@@ -191,18 +199,14 @@ def render_caption_pil(
     draw = ImageDraw.Draw(img)
     # Main box (Minecraft-style dark fill)
     draw.rectangle([(0, 0), (total_w - 1, box_h - 1)], fill=fill_color, outline=None)
-    # Minecraft-style pixel bevel: light top/left, dark bottom/right (2px)
+    # Enhanced 3D bevel: bright highlight top/left, dark shadow bottom/right (like MC GUI)
     b = CAPTION_BORDER_PX
-    light = tuple(CAPTION_BORDER_LIGHT[:3])  # RGB for draw
-    dark = tuple(CAPTION_BORDER_DARK[:3])
+    light = (255, 255, 255)
+    dark = (0, 0, 0)
     for i in range(b):
-        # Top edge (light)
         draw.line([(i, i), (total_w - 1 - i, i)], fill=light)
-        # Left edge (light)
         draw.line([(i, i), (i, box_h - 1 - i)], fill=light)
-        # Bottom edge (dark)
         draw.line([(i, box_h - 1 - i), (total_w - 1 - i, box_h - 1 - i)], fill=dark)
-        # Right edge (dark)
         draw.line([(total_w - 1 - i, i), (total_w - 1 - i, box_h - 1 - i)], fill=dark)
     if speech_bubble and tail_h:
         cx = total_w // 2
@@ -212,14 +216,15 @@ def render_caption_pil(
             fill=fill_color,
             outline=None,
         )
-        # Bevel on tail: dark bottom edge
         draw.line([(cx - tail_w, total_h - 1), (cx + tail_w, total_h - 1)], fill=dark)
+    # Text with thicker Minecraft-like shadow (dark offset in all directions)
+    shadow_fill = (32, 32, 32, 255)
     for i, line in enumerate(lines):
         y = pad + i * line_height
         for dx in [-2, -1, 0, 1, 2]:
             for dy in [-2, -1, 0, 1, 2]:
                 if dx != 0 or dy != 0:
-                    draw.text((pad + dx, y + dy), line, font=font, fill=(0, 0, 0, 255))
+                    draw.text((pad + dx, y + dy), line, font=font, fill=shadow_fill)
         draw.text((pad, y), line, font=font, fill=(255, 255, 255, 255))
     return np.array(img)
 
@@ -244,6 +249,40 @@ def overlay_caption_on_frame(
     rgb = caption_rgba[:, :, :3]
     roi[:] = (alpha * rgb + (1 - alpha) * roi).astype(np.uint8)
     return frame
+
+
+class FaceKalmanTracker:
+    """Smooth face position with a Kalman filter (position + velocity model)."""
+    def __init__(self):
+        # 4 states (x, y, dx, dy), 2 measurements (x, y)
+        self.kf = cv2.KalmanFilter(4, 2, 0)
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]
+        ], dtype=np.float32)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0], [0, 1, 0, 0]
+        ], dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self.initialized = False
+
+    def update(self, x=None, y=None):
+        """Update with measurement (x, y). If x is None, only predict (no face)."""
+        if x is None or y is None:
+            if not self.initialized:
+                return None, None
+            pred = self.kf.predict()
+            return float(pred[0, 0]), float(pred[1, 0])
+        measurement = np.array([[np.float32(x)], [np.float32(y)]])
+        if not self.initialized:
+            self.kf.statePre = np.array([[x], [y], [0], [0]], dtype=np.float32)
+            self.kf.statePost = np.array([[x], [y], [0], [0]], dtype=np.float32)
+            self.initialized = True
+            return float(x), float(y)
+        self.kf.predict()
+        estimated = self.kf.correct(measurement)
+        return float(estimated[0, 0]), float(estimated[1, 0])
 
 
 class EmotionEstimator:
@@ -325,10 +364,11 @@ def main():
     stt = StreamingSTT(text_queue) if HAS_STT else None
     if HAS_STT and stt.start():
         mode = get_caption_mode()
+        engine = getattr(stt, "_engine", "batch")
         if mode == "streaming":
-            print("Caption mode: streaming (real-time)")
+            print("Caption mode: streaming (real-time) —", engine)
         else:
-            print("Caption mode: fast batch (install vosk + model for streaming)")
+            print("Caption mode: fast batch (install faster-whisper or vosk for streaming)")
     else:
         print("Speech: install speech_recognition and PyAudio (and optionally vosk for real-time)")
 
@@ -359,6 +399,7 @@ def main():
     last_face_bbox = None
     frame_count = 0
     emotion_smooth_prev = "neutral"
+    face_tracker = FaceKalmanTracker()
 
     # Prefer MediaPipe Face Mesh if model is present (smoother tracking + real emotion)
     face_landmarker_mp = None
@@ -398,12 +439,16 @@ def main():
                 last_face_bbox = (x_f, y_f, bw, bh)
                 new_cx = x_f + bw / 2
                 new_ty = float(y_f)
-                face_center_x = face_center_x + FACE_SMOOTH * (new_cx - face_center_x)
-                face_top_y = face_top_y + FACE_SMOOTH * (new_ty - face_top_y)
+                cx, ty = face_tracker.update(new_cx, new_ty)
+                if cx is not None:
+                    face_center_x, face_top_y = cx, ty
                 emotion = emotion_from_blendshapes(blendshapes_mp, emotion_smooth_prev)
                 emotion_smooth_prev = emotion
             else:
                 last_face_bbox = None
+                cx, ty = face_tracker.update(None, None)
+                if cx is not None:
+                    face_center_x, face_top_y = cx, ty
                 emotion = emotion_smooth_prev
         elif frame_count % FACE_DETECT_EVERY_N == 0:
             small_w = max(80, int(w * FACE_DETECT_SCALE))
@@ -437,10 +482,14 @@ def main():
                 last_face_bbox = (x_f, y_f, bw, bh)
                 new_cx = x_f + bw / 2
                 new_ty = float(y_f)
-                face_center_x = face_center_x + FACE_SMOOTH * (new_cx - face_center_x)
-                face_top_y = face_top_y + FACE_SMOOTH * (new_ty - face_top_y)
+                cx, ty = face_tracker.update(new_cx, new_ty)
+                if cx is not None:
+                    face_center_x, face_top_y = cx, ty
             else:
                 last_face_bbox = None
+                cx, ty = face_tracker.update(None, None)
+                if cx is not None:
+                    face_center_x, face_top_y = cx, ty
             emotion = emotion_estimator.update(None)
 
         # Emotion smoothing: require N consecutive frames before switching (reduces jitter)
@@ -577,7 +626,7 @@ def main():
         elif key == ord("h"):
             caption_history_lines = 0 if caption_history_lines > 0 else 2
         elif key == ord("f"):
-            fade_in_frames = 0 if fade_in_frames > 0 else 1
+            fade_in_frames = 0 if fade_in_frames > 0 else 4
         elif key == ord("c"):
             apply_color_filter = not apply_color_filter
         elif key == ord("m"):

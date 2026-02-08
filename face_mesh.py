@@ -71,10 +71,13 @@ def create_face_landmarker():
                 print("  ", os.path.join(d, name), file=sys.stderr)
         return None
     try:
+        base_opts = BaseOptions(model_asset_path=path)
         options = FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=path),
+            base_options=base_opts,
             running_mode=RunningMode.VIDEO,
             num_faces=1,
+            min_face_detection_confidence=0.3,
+            min_face_presence_confidence=0.3,
             output_face_blendshapes=True,
             output_facial_transformation_matrixes=False,
         )

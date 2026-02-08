@@ -26,6 +26,9 @@ venv/
 env/
 .env/
 
+# Local env vars (API keys) – do not commit
+.env
+
 # Vosk models (large, downloaded separately)
 models/
 vosk-model/
