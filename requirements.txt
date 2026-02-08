@@ -8,3 +8,6 @@ PyAudio>=0.2.14
 Pillow>=10.0.0
 numpy>=1.24.0
 vosk>=0.3.45
+
+# Optional: live translation (press M in app)
+# googletrans==4.0.0-rc1

@@ -34,11 +34,12 @@ except ImportError:
 RESULT_FINAL = True
 RESULT_PARTIAL = False
 
-# Vosk model: prefer larger model first (better word recognition)
+# Vosk model: large model first = much better accuracy (run download_vosk_model.py --large)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIRS = [
     os.path.join(SCRIPT_DIR, "models"),
     os.path.join(SCRIPT_DIR, "vosk-model"),
+    os.path.join(os.getcwd(), "models"),
     os.path.join(os.path.expanduser("~"), ".vosk", "models"),
 ]
 MODEL_NAMES = ["vosk-model-en-us-0.22", "vosk-model-small-en-us-0.15", "model"]
@@ -93,7 +94,7 @@ class StreamingSTT:
             self._thread.join(timeout=2.0)
 
     def _run_vosk(self):
-        """Streaming: push partial and final results. Larger chunks = better word boundaries."""
+        """Streaming: push partials often (instant feel) and finals (accurate phrases)."""
         rec = vosk.KaldiRecognizer(self._model, self.sample_rate)
         rec.SetWords(False)
         p = pyaudio.PyAudio()
@@ -103,11 +104,11 @@ class StreamingSTT:
                 channels=1,
                 rate=self.sample_rate,
                 input=True,
-                frames_per_buffer=8000,
+                frames_per_buffer=4096,
             )
         except Exception:
             return
-        # Small chunks = partials very often = minimal delay (best for real-time)
+        # Small chunks = partials every ~75ms so text appears instantly as you speak
         chunk_samples = 1200
         while self.running and stream.is_active():
             try:
@@ -134,14 +135,14 @@ class StreamingSTT:
         p.terminate()
 
     def _run_batch(self):
-        """Batch mode: language hint + ambient calibration for better word recognition."""
+        """Batch mode: longer chunks + calibration for better accuracy."""
         recognizer = sr.Recognizer()
-        chunk_sec = 0.4  # Slightly longer = more context for Google, better accuracy
+        chunk_sec = 0.6  # More context = better accuracy (still responsive)
         mic = None
         try:
             mic = sr.Microphone(sample_rate=16000)
             with mic as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                recognizer.adjust_for_ambient_noise(source, duration=0.8)
         except Exception:
             return
         while self.running and mic:
@@ -151,7 +152,7 @@ class StreamingSTT:
                 if not self.running:
                     break
                 try:
-                    text = recognizer.recognize_google(audio, language="en-US")
+                    text = recognizer.recognize_google(audio, language="en-US", show_all=False)
                     if text:
                         self.result_queue.put((text.strip(), RESULT_FINAL))
                 except (sr.UnknownValueError, sr.RequestError):

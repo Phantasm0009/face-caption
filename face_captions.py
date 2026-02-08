@@ -42,6 +42,15 @@ except ImportError:
     detect_face = None
     emotion_from_blendshapes = None
 
+# Optional translation (pip install googletrans==4.0.0-rc1)
+try:
+    from googletrans import Translator
+    _translator = Translator()
+    HAS_TRANSLATE = True
+except ImportError:
+    _translator = None
+    HAS_TRANSLATE = False
+
 # --- Config ---
 CAMERA_INDEX = 1
 # Bigger, readable captions (large so "I oh" and short phrases are easy to read)
@@ -63,11 +72,15 @@ FACE_DETECT_SCALE = 0.45
 FACE_DETECT_EVERY_N = 1
 FACE_SMOOTH = 0.28
 MAX_CAPTION_LINES = 2
-# Real-time: show full text immediately (no reveal delay). Set to 3–5 for smooth type-in effect.
-REVEAL_CHARS_PER_FRAME = 999  # 999 = no delay; lower = smoother type-in, more delay
+# Instant captions: show text as soon as it’s said (999 = no typewriter delay)
+REVEAL_CHARS_PER_FRAME = 999
 # Minecraft-style chat background (default when emotion color not used)
-CAPTION_BG_COLOR = (30, 30, 30, 200)
+CAPTION_BG_COLOR = (45, 42, 34, 230)  # dark wood/chest tone for Minecraft look
 CAPTION_BG_PADDING = 12
+# Pixel border for Minecraft GUI look (highlight top/left, shadow bottom/right)
+CAPTION_BORDER_LIGHT = (90, 85, 72, 255)   # bevel highlight
+CAPTION_BORDER_DARK = (20, 18, 15, 255)    # bevel shadow
+CAPTION_BORDER_PX = 2                        # border width in pixels
 # Emotion -> (emoji, color name). Color used to tint the caption box.
 EMOTIONS = {
     "happy": ("😊", "yellow"),
@@ -84,11 +97,15 @@ EMOTION_COLORS = {
     "red": (50, 20, 20, 220),     # angry
     "white": (35, 35, 35, 200),   # neutral
 }
-# UI toggles
+# UI toggles (can also be toggled live: T=tail, H=history, F=fade, C=color filter, M=translate)
 SHOW_FACE_BOX = False              # Set True to draw green face outline
 SPEECH_BUBBLE_TAIL = True         # Draw a tail on the caption box pointing to head
 CAPTION_HISTORY_LINES = 2         # Exactly 2 lines: top = oldest, bottom = newest (real-time)
-FADE_IN_FRAMES = 4                # Fade-in animation when caption updates (0 = no fade)
+FADE_IN_FRAMES = 1                # Snappy fade (1–2 = instant feel; 0 = no fade)
+# Emotion: require this many consecutive frames before switching (reduces jitter)
+EMOTION_HOLD_FRAMES = 3
+# Translation (optional): pip install googletrans==4.0.0-rc1
+TRANSLATION_DEST = "es"           # Target language code when translation is enabled
 
 
 def get_minecraft_font(size: int):
@@ -172,7 +189,21 @@ def render_caption_pil(
     fill_color = bg_color if bg_color is not None else CAPTION_BG_COLOR
     img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+    # Main box (Minecraft-style dark fill)
     draw.rectangle([(0, 0), (total_w - 1, box_h - 1)], fill=fill_color, outline=None)
+    # Minecraft-style pixel bevel: light top/left, dark bottom/right (2px)
+    b = CAPTION_BORDER_PX
+    light = tuple(CAPTION_BORDER_LIGHT[:3])  # RGB for draw
+    dark = tuple(CAPTION_BORDER_DARK[:3])
+    for i in range(b):
+        # Top edge (light)
+        draw.line([(i, i), (total_w - 1 - i, i)], fill=light)
+        # Left edge (light)
+        draw.line([(i, i), (i, box_h - 1 - i)], fill=light)
+        # Bottom edge (dark)
+        draw.line([(i, box_h - 1 - i), (total_w - 1 - i, box_h - 1 - i)], fill=dark)
+        # Right edge (dark)
+        draw.line([(total_w - 1 - i, i), (total_w - 1 - i, box_h - 1 - i)], fill=dark)
     if speech_bubble and tail_h:
         cx = total_w // 2
         tail_w = 12
@@ -181,6 +212,8 @@ def render_caption_pil(
             fill=fill_color,
             outline=None,
         )
+        # Bevel on tail: dark bottom edge
+        draw.line([(cx - tail_w, total_h - 1), (cx + tail_w, total_h - 1)], fill=dark)
     for i, line in enumerate(lines):
         y = pad + i * line_height
         for dx in [-2, -1, 0, 1, 2]:
@@ -311,7 +344,16 @@ def main():
     last_caption_text = ""
     frames_since_caption_change = 999
     show_face_box = SHOW_FACE_BOX
-    window_name = "Face-following captions (Q=quit B=face box)"
+    show_speech_tail = SPEECH_BUBBLE_TAIL
+    caption_history_lines = CAPTION_HISTORY_LINES
+    fade_in_frames = FADE_IN_FRAMES
+    apply_color_filter = False
+    translate_enabled = False
+    last_translated = ""
+    last_final_translated = ""  # which last_final we translated
+    emotion_hold_prev = "neutral"
+    emotion_hold_frames = 0
+    window_name = "Face-following captions (Q=quit B=box T=tail H=history F=fade C=color M=translate)"
 
     face_center_x, face_top_y = 0.0, 0.0
     last_face_bbox = None
@@ -401,6 +443,17 @@ def main():
                 last_face_bbox = None
             emotion = emotion_estimator.update(None)
 
+        # Emotion smoothing: require N consecutive frames before switching (reduces jitter)
+        if emotion != emotion_hold_prev:
+            emotion_hold_frames += 1
+            if emotion_hold_frames >= EMOTION_HOLD_FRAMES:
+                emotion_hold_prev = emotion
+                emotion_hold_frames = 0
+            else:
+                emotion = emotion_hold_prev
+        else:
+            emotion_hold_frames = 0
+
         face_bbox = last_face_bbox
 
         # Drain STT queue: partial = live text as you speak; final = replace (only that phrase, no old text)
@@ -414,11 +467,10 @@ def main():
                 if is_final:
                     last_final = text
                     live_partial = ""
-                    if CAPTION_HISTORY_LINES > 0 and text:
+                    if caption_history_lines > 0 and text:
                         now = time.time()
                         caption_history.append((text, now))
-                        # Keep only last 2 entries
-                        if len(caption_history) > CAPTION_HISTORY_LINES:
+                        if len(caption_history) > caption_history_lines:
                             caption_history.pop(0)
                 else:
                     live_partial = text
@@ -440,9 +492,21 @@ def main():
             reveal_len = min(reveal_len + REVEAL_CHARS_PER_FRAME, target_len)
         displayed_caption = current_caption[:reveal_len]
 
+        # Translation: when enabled, translate last_final once and show with original
+        if translate_enabled and HAS_TRANSLATE and _translator and last_final and last_final != last_final_translated:
+            try:
+                last_translated = _translator.translate(last_final, dest=TRANSLATION_DEST).text or ""
+                last_final_translated = last_final
+            except Exception:
+                last_translated = ""
+                last_final_translated = last_final
+        if not translate_enabled:
+            last_translated = ""
+            last_final_translated = ""
+
         # Exactly 2 lines: top = oldest, bottom = newest (real-time); expire after CAPTION_TIMEOUT_SEC
         now = time.time()
-        if CAPTION_HISTORY_LINES > 0 and caption_history:
+        if caption_history_lines > 0 and caption_history:
             # Drop expired entries (text goes away after timeout)
             caption_history[:] = [(t, ts) for t, ts in caption_history if now - ts < CAPTION_TIMEOUT_SEC]
             # At most 2 lines: oldest, newest (newest can be live partial)
@@ -455,6 +519,9 @@ def main():
                 display_text = line2 or line1 or ""
         else:
             display_text = displayed_caption if displayed_caption else ""
+        # When translation is on: show current phrase + translation (2 lines)
+        if translate_enabled and last_translated and display_text.strip() and display_text != "...":
+            display_text = (display_text.split("\n")[-1] if "\n" in display_text else display_text) + "\n(" + last_translated + ")"
         if not display_text.strip():
             display_text = "..."
 
@@ -467,15 +534,19 @@ def main():
                 display_text,
                 CAPTION_FONT_SIZE,
                 bg_color=bg_color,
-                speech_bubble=SPEECH_BUBBLE_TAIL,
+                speech_bubble=show_speech_tail,
             )
         else:
             frames_since_caption_change += 1
 
-        # Fade-in: ramp alpha for first FADE_IN_FRAMES when caption changes
+        # Fade-in: ramp alpha for first fade_in_frames when caption changes
         alpha_mult = 1.0
-        if FADE_IN_FRAMES > 0 and frames_since_caption_change < FADE_IN_FRAMES:
-            alpha_mult = 0.5 + 0.5 * (frames_since_caption_change / FADE_IN_FRAMES)
+        if fade_in_frames > 0 and frames_since_caption_change < fade_in_frames:
+            alpha_mult = 0.5 + 0.5 * (frames_since_caption_change / fade_in_frames)
+
+        # Optional color filter (e.g. thermal/neon) when toggled
+        if apply_color_filter:
+            frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
 
         cx, ty = int(face_center_x), int(face_top_y)
         caption_x = cx
@@ -501,6 +572,19 @@ def main():
             break
         if key == ord("b"):
             show_face_box = not show_face_box
+        elif key == ord("t"):
+            show_speech_tail = not show_speech_tail
+        elif key == ord("h"):
+            caption_history_lines = 0 if caption_history_lines > 0 else 2
+        elif key == ord("f"):
+            fade_in_frames = 0 if fade_in_frames > 0 else 1
+        elif key == ord("c"):
+            apply_color_filter = not apply_color_filter
+        elif key == ord("m"):
+            translate_enabled = not translate_enabled
+            if not translate_enabled:
+                last_translated = ""
+                last_final_translated = ""
 
     if stt:
         stt.stop()
