@@ -9,6 +9,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIRS = [
     os.path.join(SCRIPT_DIR, "models"),
     os.path.join(SCRIPT_DIR),
+    os.path.join(os.getcwd(), "models"),
+    os.getcwd(),
 ]
 MODEL_NAMES = ["face_landmarker_v2.task", "face_landmarker.task"]
 
@@ -62,6 +64,11 @@ def create_face_landmarker():
         return None
     path = _find_model_path()
     if not path:
+        import sys
+        print("Face Landmarker: no model file found. Looked in:", file=sys.stderr)
+        for d in MODEL_DIRS:
+            for name in MODEL_NAMES:
+                print("  ", os.path.join(d, name), file=sys.stderr)
         return None
     try:
         options = FaceLandmarkerOptions(
@@ -72,7 +79,10 @@ def create_face_landmarker():
             output_facial_transformation_matrixes=False,
         )
         return FaceLandmarker.create_from_options(options)
-    except Exception:
+    except Exception as e:
+        import sys
+        print("Face Landmarker: failed to load model:", path, file=sys.stderr)
+        print("  ", e, file=sys.stderr)
         return None
 
 

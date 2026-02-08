@@ -47,8 +47,11 @@ CAMERA_INDEX = 1
 # Bigger, readable captions (large so "I oh" and short phrases are easy to read)
 CAPTION_FONT_SIZE = 52
 CAPTION_MAX_WIDTH = 580
-CAPTION_OFFSET_ABOVE_HEAD = 22
+# Gap between bottom of caption box and top of head (larger = caption sits well above head)
+CAPTION_OFFSET_ABOVE_HEAD = 55
 MAX_CAPTION_LEN = 100
+# Captions disappear after this many seconds of no new content
+CAPTION_TIMEOUT_SEC = 5.0
 EMOTION_SMOOTH = 0.3
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 # Prefer 720p capture = smooth stream (no heavy 1080p resize every frame)
@@ -84,7 +87,7 @@ EMOTION_COLORS = {
 # UI toggles
 SHOW_FACE_BOX = False              # Set True to draw green face outline
 SPEECH_BUBBLE_TAIL = True         # Draw a tail on the caption box pointing to head
-CAPTION_HISTORY_LINES = 2         # 0 = current only; 2 = show last 2 phrases + current (chat-style)
+CAPTION_HISTORY_LINES = 2         # Exactly 2 lines: top = oldest, bottom = newest (real-time)
 FADE_IN_FRAMES = 4                # Fade-in animation when caption updates (0 = no fade)
 
 
@@ -143,14 +146,14 @@ def render_caption_pil(
     if not text or not HAS_PIL:
         return None
     font = get_minecraft_font(font_size)
-    # Multi-phrase (chat history): split by newline, wrap each, show last 6 lines so history is visible
+    # Two lines only: oldest on top, newest on bottom
     if "\n" in text:
         all_lines = []
         for phrase in text.split("\n"):
             phrase = (phrase or "").strip()
             if phrase:
                 all_lines.extend(_wrap_text(phrase, font, CAPTION_MAX_WIDTH))
-        max_total = 6 if "\n" in text else MAX_CAPTION_LINES
+        max_total = 2
         lines = all_lines[-max_total:]
     else:
         lines = _wrap_text(text, font, CAPTION_MAX_WIDTH)
@@ -296,10 +299,10 @@ def main():
     else:
         print("Speech: install speech_recognition and PyAudio (and optionally vosk for real-time)")
 
-    # Caption: show only current content; smooth reveal so text flows in
+    # Caption: 2 lines only (oldest top, newest bottom); entries expire after CAPTION_TIMEOUT_SEC
     live_partial = ""
     last_final = ""
-    caption_history = []
+    caption_history = []  # list of (text, timestamp)
     current_caption = ""
     reveal_len = 0
     emotion_estimator = EmotionEstimator()
@@ -412,7 +415,9 @@ def main():
                     last_final = text
                     live_partial = ""
                     if CAPTION_HISTORY_LINES > 0 and text:
-                        caption_history.append(text)
+                        now = time.time()
+                        caption_history.append((text, now))
+                        # Keep only last 2 entries
                         if len(caption_history) > CAPTION_HISTORY_LINES:
                             caption_history.pop(0)
                 else:
@@ -435,12 +440,19 @@ def main():
             reveal_len = min(reveal_len + REVEAL_CHARS_PER_FRAME, target_len)
         displayed_caption = current_caption[:reveal_len]
 
-        # Build display: optional history (older on top) + current line (no duplicate of last final)
+        # Exactly 2 lines: top = oldest, bottom = newest (real-time); expire after CAPTION_TIMEOUT_SEC
+        now = time.time()
         if CAPTION_HISTORY_LINES > 0 and caption_history:
-            if displayed_caption and displayed_caption != caption_history[-1]:
-                display_text = "\n".join(caption_history) + "\n" + displayed_caption
+            # Drop expired entries (text goes away after timeout)
+            caption_history[:] = [(t, ts) for t, ts in caption_history if now - ts < CAPTION_TIMEOUT_SEC]
+            # At most 2 lines: oldest, newest (newest can be live partial)
+            valid = caption_history[-2:]
+            line1 = valid[0][0] if len(valid) >= 1 else ""
+            line2 = displayed_caption if displayed_caption else (valid[1][0] if len(valid) >= 2 else "")
+            if line1 and line2:
+                display_text = line1 + "\n" + line2
             else:
-                display_text = "\n".join(caption_history)
+                display_text = line2 or line1 or ""
         else:
             display_text = displayed_caption if displayed_caption else ""
         if not display_text.strip():
@@ -470,8 +482,11 @@ def main():
         caption_y = ty - CAPTION_OFFSET_ABOVE_HEAD
         if last_caption_render is not None:
             cw = last_caption_render.shape[1]
+            ch = last_caption_render.shape[0]
+            # Place caption fully above head: bottom of box = ty - gap, top = ty - gap - height
+            caption_y = ty - ch - CAPTION_OFFSET_ABOVE_HEAD
+            caption_y = max(0, caption_y)  # don't draw off top of frame
             caption_x = cx - cw // 2
-            caption_y = ty - last_caption_render.shape[0] - CAPTION_OFFSET_ABOVE_HEAD
             frame = overlay_caption_on_frame(
                 frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
             )
@@ -480,6 +495,7 @@ def main():
             x, y, bw, bh = face_bbox
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
 
+        cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
