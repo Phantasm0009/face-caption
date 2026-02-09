@@ -578,6 +578,9 @@ def main():
         if caption_history_lines > 0 and caption_history:
             # Drop expired entries (text goes away after timeout)
             caption_history[:] = [(t, ts) for t, ts in caption_history if now - ts < CAPTION_TIMEOUT_SEC]
+            MAX_HISTORY_ENTRIES = 10
+            if len(caption_history) > MAX_HISTORY_ENTRIES:
+                caption_history[:] = caption_history[-MAX_HISTORY_ENTRIES:]
             # At most 2 lines: oldest, newest (newest can be live partial)
             valid = caption_history[-2:]
             line1 = valid[0][0] if len(valid) >= 1 else ""

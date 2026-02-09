@@ -44,15 +44,15 @@ try:
 except ImportError:
     HAS_SR = False
 
-# Optional: Deepgram live (best quality; set DEEPGRAM_API_KEY)
+# Optional: Deepgram live (best quality; set DEEPGRAM_API_KEY) — SDK 5.x API
 try:
-    from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
+    from deepgram import DeepgramClient
+    from deepgram.core.events import EventType
     HAS_DEEPGRAM = True
 except ImportError:
     HAS_DEEPGRAM = False
     DeepgramClient = None
-    LiveTranscriptionEvents = None
-    LiveOptions = None
+    EventType = None
 
 # Results: (text, is_final). is_final=True => final phrase; False => partial (live)
 RESULT_FINAL = True
@@ -94,40 +94,33 @@ class StreamingSTT:
         self._use_deepgram = False
         self._model = None
         self._engine = "batch"
-        self._dg_connection = None
+        self._dg_client = None
 
     def start(self) -> bool:
         api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
         if api_key and HAS_DEEPGRAM and HAS_PYAUDIO:
             try:
-                client = DeepgramClient(api_key)
-                try:
-                    self._dg_connection = client.listen.websocket.v("1")
-                except AttributeError:
-                    self._dg_connection = client.listen.live.v("1")
-                self._dg_connection.on(
-                    LiveTranscriptionEvents.Transcript,
-                    lambda result, **kwargs: self._on_deepgram_transcript(result, **kwargs),
-                )
-                self._dg_connection.start(
-                    LiveOptions(
-                        model="nova-2",
-                        language="en-US",
-                        smart_format=True,
-                        interim_results=True,
-                        utterance_end_ms=800,
-                    )
-                )
+                self._dg_client = DeepgramClient(api_key=api_key)
                 self._use_deepgram = True
                 self._engine = "deepgram"
-                print("STT: Using Deepgram API (live)")
+                print("STT: Using Deepgram API (live). If no speech appears, check default mic or set DEEPGRAM_INPUT_DEVICE_INDEX.")
             except Exception as e:
-                print("STT: Deepgram failed ({0}), using Vosk for speed.".format(type(e).__name__))
+                print("STT: Deepgram failed ({0}), using next engine.".format(type(e).__name__))
                 if os.environ.get("DEBUG_STT"):
                     print("  ", e)
+                self._dg_client = None
         if self._use_deepgram:
             self._thread = threading.Thread(target=self._run_deepgram, daemon=True)
-        elif HAS_VOSK and HAS_PYAUDIO:
+        elif HAS_FASTER_WHISPER and HAS_PYAUDIO and HAS_NUMPY:
+            try:
+                self._model = WhisperModel("base.en", device="cpu", compute_type="int8")
+                self._use_faster_whisper = True
+                self._engine = "faster-whisper"
+                self._thread = threading.Thread(target=self._run_faster_whisper, daemon=True)
+            except Exception as e:
+                if os.environ.get("DEBUG_STT"):
+                    print("Faster-whisper init failed:", e)
+        if not self._thread and HAS_VOSK and HAS_PYAUDIO:
             model_path = _find_vosk_model()
             if model_path:
                 try:
@@ -137,15 +130,6 @@ class StreamingSTT:
                     self._thread = threading.Thread(target=self._run_vosk, daemon=True)
                 except Exception:
                     pass
-        if not self._thread and HAS_FASTER_WHISPER and HAS_PYAUDIO and HAS_NUMPY:
-            try:
-                self._model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-                self._use_faster_whisper = True
-                self._engine = "faster-whisper"
-                self._thread = threading.Thread(target=self._run_faster_whisper, daemon=True)
-            except Exception as e:
-                if os.environ.get("DEBUG_STT"):
-                    print("Faster-whisper init failed:", e)
         if not self._thread:
             if HAS_SR and HAS_PYAUDIO:
                 self._thread = threading.Thread(target=self._run_batch, daemon=True)
@@ -195,7 +179,7 @@ class StreamingSTT:
                     vad_filter=True,
                     vad_parameters=dict(
                         min_silence_duration_ms=250,
-                        speech_pad_ms=50,
+                        speech_pad_ms=100,
                     ),
                     no_speech_threshold=0.5,
                 )
@@ -212,47 +196,93 @@ class StreamingSTT:
             pass
         p.terminate()
 
-    def _on_deepgram_transcript(self, result, **kwargs):
+    def _on_dg_message(self, message):
+        """Handle Deepgram SDK 5.x MESSAGE event (ListenV1ResultsEvent)."""
         try:
-            sentence = result.channel.alternatives[0].transcript
-            if sentence:
-                is_final = getattr(result, "is_final", True)
-                self.result_queue.put((sentence.strip(), RESULT_FINAL if is_final else RESULT_PARTIAL))
+            # Skip non-Results (e.g. Metadata, UtteranceEnd)
+            if not getattr(message, "channel", None):
+                return
+            ch = message.channel
+            if not getattr(ch, "alternatives", None) or not ch.alternatives:
+                return
+            sentence = (ch.alternatives[0].transcript or "").strip()
+            if not sentence:
+                return
+            is_final = getattr(message, "speech_final", None)
+            if is_final is None:
+                is_final = getattr(message, "is_final", True)
+            self.result_queue.put((sentence, RESULT_FINAL if is_final else RESULT_PARTIAL))
         except Exception:
             pass
 
     def _run_deepgram(self):
-        """Send mic audio to Deepgram live connection."""
+        """Send mic audio to Deepgram live connection (SDK 5.x: connect + socket)."""
+        if not self._dg_client:
+            return
         p = pyaudio.PyAudio()
+        # Optional: set DEEPGRAM_INPUT_DEVICE_INDEX if default mic is wrong (e.g. on Windows)
+        input_device = None
+        try:
+            idx = os.environ.get("DEEPGRAM_INPUT_DEVICE_INDEX")
+            if idx is not None:
+                input_device = int(idx)
+        except ValueError:
+            pass
         try:
             stream = p.open(
                 format=pyaudio.paInt16,
                 channels=1,
                 rate=self.sample_rate,
                 input=True,
+                input_device_index=input_device,
                 frames_per_buffer=4096,
             )
-        except Exception:
+        except Exception as e:
+            print("Deepgram: Could not open microphone.", e)
             return
-        while self.running and stream.is_active():
-            try:
-                data = stream.read(2048, exception_on_overflow=False)
-                if data and self._dg_connection:
-                    self._dg_connection.send(data)
-            except Exception:
-                pass
-            time.sleep(0.02)
+        try:
+            # Required for raw PCM: encoding + sample_rate. Keep optional params minimal to avoid HTTP 400.
+            with self._dg_client.listen.v1.connect(
+                model="nova-2",
+                language="en-US",
+                encoding="linear16",
+                sample_rate=str(self.sample_rate),
+                interim_results="true",
+            ) as socket_client:
+                socket_client.on(EventType.MESSAGE, self._on_dg_message)
+                listener_done = threading.Event()
+                def run_listener():
+                    try:
+                        socket_client.start_listening()
+                    except Exception:
+                        pass
+                    finally:
+                        listener_done.set()
+                t = threading.Thread(target=run_listener, daemon=True)
+                t.start()
+                try:
+                    while self.running and stream.is_active():
+                        try:
+                            data = stream.read(2048, exception_on_overflow=False)
+                            if data:
+                                socket_client._send(data)
+                        except Exception:
+                            pass
+                        time.sleep(0.02)
+                finally:
+                    try:
+                        socket_client._websocket.close()
+                    except Exception:
+                        pass
+                    listener_done.wait(timeout=2.0)
+        except Exception as e:
+            print("Deepgram connection error:", e)
         try:
             stream.stop_stream()
             stream.close()
         except Exception:
             pass
         p.terminate()
-        try:
-            if self._dg_connection:
-                self._dg_connection.finish()
-        except Exception:
-            pass
 
     def _run_vosk(self):
         """Streaming: push partials often (instant feel) and finals (accurate phrases)."""

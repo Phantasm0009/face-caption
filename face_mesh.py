@@ -82,6 +82,7 @@ def create_face_landmarker():
                 num_faces=1,
                 min_face_detection_confidence=0.5,
                 min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
                 output_face_blendshapes=True,
                 output_facial_transformation_matrixes=False,
             )
@@ -94,6 +95,7 @@ def create_face_landmarker():
                 num_faces=1,
                 min_face_detection_confidence=0.5,
                 min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
                 output_face_blendshapes=True,
                 output_facial_transformation_matrixes=False,
             )
