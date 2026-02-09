@@ -50,6 +50,27 @@ except ImportError:
     detect_face = None
     emotion_from_blendshapes = None
 
+# MediaPipe Hands: prefer Tasks API (hand_landmarker.task), fallback to legacy solutions
+try:
+    from hand_landmarker import (
+        create_hand_landmarker,
+        detect_hands as detect_hands_tasks,
+        HAS_HAND_TASKS,
+    )
+except ImportError:
+    create_hand_landmarker = None
+    detect_hands_tasks = None
+    HAS_HAND_TASKS = False
+
+try:
+    import mediapipe as mp
+    _solutions = getattr(mp, "solutions", None)
+    _mp_hands_module = getattr(_solutions, "hands", None) if _solutions else None
+    HAS_HANDS_LEGACY = _mp_hands_module is not None
+except (ImportError, AttributeError):
+    _mp_hands_module = None
+    HAS_HANDS_LEGACY = False
+
 # Optional translation (pip install googletrans==4.0.0-rc1; may conflict with deepgram's httpcore)
 try:
     from googletrans import Translator
@@ -63,12 +84,12 @@ except (ImportError, AttributeError):
 CAMERA_INDEX = 1
 # Bigger, readable captions (large so "I oh" and short phrases are easy to read)
 CAPTION_FONT_SIZE = 52
-CAPTION_MAX_WIDTH = 580
+CAPTION_MAX_WIDTH = 620
 # Gap between bottom of caption box and top of head (larger = caption sits well above head)
 CAPTION_OFFSET_ABOVE_HEAD = 55
-MAX_CAPTION_LEN = 100
-# Captions disappear after this many seconds of no new content (lower = less clutter)
-CAPTION_TIMEOUT_SEC = 3.0
+MAX_CAPTION_LEN = 220
+# Captions disappear after this many seconds (longer = see messages a bit longer)
+CAPTION_TIMEOUT_SEC = 4.5
 EMOTION_SMOOTH = 0.3
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 # Prefer 720p capture = smooth stream (no heavy 1080p resize every frame)
@@ -89,6 +110,10 @@ CAPTION_BG_PADDING = 12
 CAPTION_BORDER_LIGHT = (90, 85, 72, 255)   # bevel highlight
 CAPTION_BORDER_DARK = (20, 18, 15, 255)    # bevel shadow
 CAPTION_BORDER_PX = 2                        # border width in pixels
+# Pinch-to-scale caption box (hand gesture: pinch in = shrink, pinch out = grow)
+CAPTION_SCALE_MIN = 0.55
+CAPTION_SCALE_MAX = 1.85
+PINCH_SENSITIVITY = 0.012   # lower = smaller pinch gesture triggers resize
 # Emotion -> (emoji, color name). Color used to tint the caption box.
 EMOTIONS = {
     "happy": ("😊", "yellow"),
@@ -109,7 +134,7 @@ EMOTION_COLORS = {
 SHOW_FACE_BOX = False              # Set True to draw green face outline
 SPEECH_BUBBLE_TAIL = True         # Draw a tail on the caption box pointing to head
 CAPTION_HISTORY_LINES = 2         # Exactly 2 lines: top = oldest, bottom = newest (real-time)
-FADE_IN_FRAMES = 0                # 0 = instant appearance (no fade); 1–4 = snappy fade
+FADE_IN_FRAMES = 2                # Short fade for smoother pop-in (0 = instant)
 # Emotion: require this many consecutive frames before switching (reduces jitter)
 EMOTION_HOLD_FRAMES = 3
 # Translation (optional): pip install googletrans==4.0.0-rc1
@@ -166,33 +191,36 @@ def render_caption_pil(
     font_size: int,
     bg_color: tuple = None,
     speech_bubble: bool = True,
+    max_width: int = None,
+    padding: int = None,
 ) -> np.ndarray:
-    """Render text in 2 lines; emotion-tinted box; optional speech-bubble tail."""
+    """Render text in 2 lines; emotion-tinted box; optional speech-bubble tail. max_width/padding for pinch scale."""
     if not text or not HAS_PIL:
         return None
     font = get_minecraft_font(font_size)
+    use_max_width = max_width if max_width is not None else CAPTION_MAX_WIDTH
+    pad = padding if padding is not None else CAPTION_BG_PADDING
     # Two lines only: oldest on top, newest on bottom
     if "\n" in text:
         all_lines = []
         for phrase in text.split("\n"):
             phrase = (phrase or "").strip()
             if phrase:
-                all_lines.extend(_wrap_text(phrase, font, CAPTION_MAX_WIDTH))
+                all_lines.extend(_wrap_text(phrase, font, use_max_width))
         max_total = 2
         lines = all_lines[-max_total:]
     else:
-        lines = _wrap_text(text, font, CAPTION_MAX_WIDTH)
+        lines = _wrap_text(text, font, use_max_width)
         if len(lines) > MAX_CAPTION_LINES:
             lines = lines[-MAX_CAPTION_LINES:]
     line_height = font_size + 4
-    pad = CAPTION_BG_PADDING
     try:
         max_w = max(font.getbbox(line)[2] - font.getbbox(line)[0] for line in lines)
     except Exception:
-        max_w = CAPTION_MAX_WIDTH
+        max_w = use_max_width
     total_w = max_w + 2 * pad
     box_h = line_height * len(lines) + 2 * pad
-    tail_h = 10 if speech_bubble else 0
+    tail_h = max(6, 10 * font_size // 52) if speech_bubble else 0
     total_h = box_h + tail_h
     fill_color = bg_color if bg_color is not None else CAPTION_BG_COLOR
     img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
@@ -254,6 +282,45 @@ def overlay_caption_on_frame(
     rgb = caption_rgba[:, :, :3]
     roi[:] = (alpha * rgb + (1 - alpha) * roi).astype(np.uint8)
     return frame
+
+
+def _pinch_distance(hand_landmarks) -> float:
+    """Distance between thumb tip (4) and index tip (8) in image coords. Returns float or None."""
+    if not hand_landmarks or len(hand_landmarks.landmark) < 9:
+        return None
+    t = hand_landmarks.landmark[4]
+    i = hand_landmarks.landmark[8]
+    return ((t.x - i.x) ** 2 + (t.y - i.y) ** 2) ** 0.5
+
+
+def _pinch_center_px(hand_landmarks, frame_w: int, frame_h: int):
+    """Legacy API: midpoint of thumb (4) and index (8) in pixel coords. Returns (x, y) or None."""
+    if not hand_landmarks or len(hand_landmarks.landmark) < 9:
+        return None
+    t = hand_landmarks.landmark[4]
+    i = hand_landmarks.landmark[8]
+    mid_x = (t.x + i.x) / 2
+    mid_y = (t.y + i.y) / 2
+    return (int(mid_x * frame_w), int(mid_y * frame_h))
+
+
+def _pinch_from_tasks_landmarks(landmarks, frame_w: int, frame_h: int):
+    """Tasks API: from list of 21 NormalizedLandmark return (pinch_dist, (center_x, center_y)) or (None, None)."""
+    if not landmarks or len(landmarks) < 9:
+        return None, None
+    t = landmarks[4]
+    i = landmarks[8]
+    tx, ty = getattr(t, "x", 0), getattr(t, "y", 0)
+    ix, iy = getattr(i, "x", 0), getattr(i, "y", 0)
+    dist = ((tx - ix) ** 2 + (ty - iy) ** 2) ** 0.5
+    cx = int((tx + ix) / 2 * frame_w)
+    cy = int((ty + iy) / 2 * frame_h)
+    return dist, (cx, cy)
+
+
+# Handle zone: right-bottom corner of caption box (fraction of width/height)
+CAPTION_HANDLE_RIGHT_FRAC = 0.45   # use right 55% of box (bigger = easier to hit)
+CAPTION_HANDLE_BOTTOM_FRAC = 0.40  # use bottom 60% of box
 
 
 class FaceKalmanTracker:
@@ -415,9 +482,11 @@ def main():
     last_final_translated = ""  # which last_final we translated
     emotion_hold_prev = "neutral"
     emotion_hold_frames = 0
-    window_name = "Face-following captions (Q=quit B=box T=tail H=history F=fade C=color M=translate)"
+    window_name = "Face captions (Q=quit B=box T=tail H=history F=fade C=color M=translate P=pinch +=/-=size)"
     caption_cache = {}
     MAX_CAPTION_CACHE_SIZE = 10
+    last_caption_scale = 1.0
+    last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
     fps_history = []
     last_fps_time = time.time()
 
@@ -426,6 +495,30 @@ def main():
     frame_count = 0
     emotion_smooth_prev = "neutral"
     face_tracker = FaceKalmanTracker()
+    caption_scale = 1.0
+    last_pinch_dist = None
+    pinch_enabled = True
+
+    # Hand landmarker: prefer MediaPipe Tasks API (same as face), fallback to legacy solutions
+    hand_landmarker_tasks = None
+    if create_hand_landmarker:
+        hand_landmarker_tasks = create_hand_landmarker()
+    hand_landmarker = None
+    if HAS_HANDS_LEGACY and _mp_hands_module:
+        try:
+            hand_landmarker = _mp_hands_module.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.4,
+            )
+        except Exception:
+            hand_landmarker = None
+    HAS_HANDS = hand_landmarker_tasks is not None or hand_landmarker is not None
+    if HAS_HANDS:
+        print("Caption resize: pinch at box corner (P=toggle) or use + / - keys")
+    else:
+        print("Caption resize: use + / - keys to change size (run download_hand_landmarker_model.py for pinch)")
 
     # Prefer MediaPipe Face Mesh if model is present (smoother tracking + real emotion)
     face_landmarker_mp = None
@@ -479,7 +572,51 @@ def main():
                 if cx is not None:
                     face_center_x, face_top_y = cx, ty
                 emotion = emotion_smooth_prev
-        elif frame_count % detect_interval == 0:
+        # Pinch-to-scale only when hand is in the caption box's right-bottom "handle" zone
+        # Use last frame's actual caption position so the zone matches the drawn corner
+        if pinch_enabled and (hand_landmarker_tasks or hand_landmarker):
+            handle_x1, handle_y1, handle_x2, handle_y2 = None, None, None, None
+            if last_caption_x is not None and last_caption_w is not None and last_caption_h is not None:
+                handle_x1 = last_caption_x + int(last_caption_w * CAPTION_HANDLE_RIGHT_FRAC)
+                handle_y1 = last_caption_y + int(last_caption_h * CAPTION_HANDLE_BOTTOM_FRAC)
+                handle_x2 = last_caption_x + last_caption_w
+                handle_y2 = last_caption_y + last_caption_h
+            rgb_hands = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            pinch_dist = None
+            center_px = None
+            if hand_landmarker_tasks and detect_hands_tasks:
+                hands_result = detect_hands_tasks(hand_landmarker_tasks, rgb_hands, timestamp_ms)
+                if hands_result and len(hands_result) > 0:
+                    pinch_dist, center_px = _pinch_from_tasks_landmarks(hands_result[0], w, h)
+            elif hand_landmarker:
+                hand_results = hand_landmarker.process(rgb_hands)
+                if hand_results.multi_hand_landmarks:
+                    hl = hand_results.multi_hand_landmarks[0]
+                    center_px = _pinch_center_px(hl, w, h)
+                    pinch_dist = _pinch_distance(hl)
+
+            if handle_x1 is not None and center_px is not None:
+                in_handle = (
+                    handle_x1 <= center_px[0] <= handle_x2
+                    and handle_y1 <= center_px[1] <= handle_y2
+                )
+                if in_handle and pinch_dist is not None:
+                    if last_pinch_dist is not None:
+                        delta = pinch_dist - last_pinch_dist
+                        if delta < -PINCH_SENSITIVITY:
+                            caption_scale = max(CAPTION_SCALE_MIN, caption_scale * 0.96)
+                        elif delta > PINCH_SENSITIVITY:
+                            caption_scale = min(CAPTION_SCALE_MAX, caption_scale * 1.04)
+                        caption_scale = max(CAPTION_SCALE_MIN, min(CAPTION_SCALE_MAX, caption_scale))
+                    last_pinch_dist = pinch_dist
+                else:
+                    last_pinch_dist = None
+            else:
+                last_pinch_dist = None
+        else:
+            last_pinch_dist = None
+        if frame_count % detect_interval == 0:
             small_w = max(80, int(w * detect_scale))
             small_h = max(60, int(h * detect_scale))
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -593,7 +730,10 @@ def main():
             line1 = valid[0][0] if len(valid) >= 1 else ""
             line2 = displayed_caption if displayed_caption else (valid[1][0] if len(valid) >= 2 else "")
             if line1 and line2:
-                display_text = line1 + "\n" + line2
+                if line1.strip() == line2.strip():
+                    display_text = line2  # avoid duplicate line
+                else:
+                    display_text = line1 + "\n" + line2
             else:
                 display_text = line2 or line1 or ""
         else:
@@ -603,10 +743,15 @@ def main():
         if not display_text.strip():
             display_text = "..."
 
-        if display_text != last_caption_text or last_caption_render is None:
+        scaled_font = max(12, int(CAPTION_FONT_SIZE * caption_scale))
+        scaled_max_width = max(200, int(CAPTION_MAX_WIDTH * caption_scale))
+        scaled_padding = max(4, int(CAPTION_BG_PADDING * caption_scale))
+        scale_key = round(caption_scale, 2)
+        if display_text != last_caption_text or last_caption_render is None or scale_key != last_caption_scale:
             frames_since_caption_change = 0
             last_caption_text = display_text
-            cache_key = (emotion, show_speech_tail, len(display_text) < 20)
+            last_caption_scale = scale_key
+            cache_key = (emotion, show_speech_tail, len(display_text) < 20, scale_key)
             if cache_key in caption_cache and caption_cache[cache_key][1] == display_text:
                 last_caption_render = caption_cache[cache_key][0]
             else:
@@ -614,9 +759,11 @@ def main():
                 bg_color = EMOTION_COLORS.get(color_name, CAPTION_BG_COLOR)
                 last_caption_render = render_caption_pil(
                     display_text,
-                    CAPTION_FONT_SIZE,
+                    scaled_font,
                     bg_color=bg_color,
                     speech_bubble=show_speech_tail,
+                    max_width=scaled_max_width,
+                    padding=scaled_padding,
                 )
                 if last_caption_render is not None:
                     if len(caption_cache) >= MAX_CAPTION_CACHE_SIZE:
@@ -656,6 +803,17 @@ def main():
             frame = overlay_caption_on_frame(
                 frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
             )
+            last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
+            # Resize handle hint: always show corner when pinch is on (so user sees where to aim)
+            if pinch_enabled:
+                grip_size = max(14, min(cw, ch) // 3)
+                x1, y1 = caption_x + cw - grip_size, caption_y + ch - grip_size
+                x2, y2 = caption_x + cw, caption_y + ch
+                color = (0, 255, 255) if HAS_HANDS else (120, 120, 120)  # bright when active, dim when keys-only
+                cv2.line(frame, (x1, y2), (x2, y2), color, 2)
+                cv2.line(frame, (x2, y1), (x2, y2), color, 2)
+        else:
+            last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
 
         if show_face_box and face_bbox:
             x, y, bw, bh = face_bbox
@@ -667,7 +825,7 @@ def main():
         fps_history = [t for t in fps_history if current_time - t < 1.0]
         fps = len(fps_history)
         if current_time - last_fps_time > 0.5:
-            cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit B=box T=tail H=history F=fade C=color M=translate)".format(fps))
+            cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit +=/-=size P=pinch)".format(fps))
             last_fps_time = current_time
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -687,6 +845,17 @@ def main():
             if not translate_enabled:
                 last_translated = ""
                 last_final_translated = ""
+        elif key == ord("p"):
+            pinch_enabled = not pinch_enabled
+            print("Pinch resize:", "ON (pinch at caption corner)" if pinch_enabled else "OFF")
+        elif key in (ord("+"), ord("=")):
+            caption_scale = min(CAPTION_SCALE_MAX, caption_scale * 1.08)
+            caption_scale = round(caption_scale, 2)
+            print("Caption size: larger ({:.0%})".format(caption_scale))
+        elif key == ord("-"):
+            caption_scale = max(CAPTION_SCALE_MIN, caption_scale * 0.92)
+            caption_scale = round(caption_scale, 2)
+            print("Caption size: smaller ({:.0%})".format(caption_scale))
 
     if stt:
         stt.stop()
