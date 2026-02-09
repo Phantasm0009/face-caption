@@ -50,12 +50,12 @@ except ImportError:
     detect_face = None
     emotion_from_blendshapes = None
 
-# Optional translation (pip install googletrans==4.0.0-rc1)
+# Optional translation (pip install googletrans==4.0.0-rc1; may conflict with deepgram's httpcore)
 try:
     from googletrans import Translator
     _translator = Translator()
     HAS_TRANSLATE = True
-except ImportError:
+except (ImportError, AttributeError):
     _translator = None
     HAS_TRANSLATE = False
 
@@ -381,9 +381,16 @@ def main():
         mode = get_caption_mode()
         engine = getattr(stt, "_engine", "batch")
         if mode == "streaming":
-            print("Caption mode: streaming (real-time) —", engine)
+            print("✓ Caption mode: streaming (real-time) — using", engine)
         else:
-            print("Caption mode: fast batch (install faster-whisper or vosk for streaming)")
+            print("✓ Caption mode: fast batch (install faster-whisper or vosk for streaming)")
+        latency_info = {
+            "deepgram": "100-200ms",
+            "faster-whisper": "200-300ms",
+            "vosk": "150-250ms",
+            "batch": "600-800ms",
+        }
+        print("  Expected latency:", latency_info.get(engine, "varies"))
     else:
         print("Speech: install speech_recognition and PyAudio (and optionally vosk for real-time)")
 

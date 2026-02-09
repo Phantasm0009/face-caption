@@ -73,6 +73,7 @@ try:
         sample_rate="16000",
         interim_results="true",
         smart_format="true",
+        endpointing="300",
     ) as socket_client:
         socket_client.on(EventType.MESSAGE, on_message)
 

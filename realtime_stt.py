@@ -122,6 +122,7 @@ class StreamingSTT:
         if self._use_deepgram:
             self._thread = threading.Thread(target=self._run_deepgram, daemon=True)
         elif HAS_FASTER_WHISPER and HAS_PYAUDIO and HAS_NUMPY:
+            print("STT: Deepgram not configured, using Faster-Whisper (offline)")
             try:
                 self._model = WhisperModel("base.en", device="cpu", compute_type="int8")
                 self._use_faster_whisper = True
@@ -251,7 +252,8 @@ class StreamingSTT:
             print("Deepgram: Could not open microphone.", e)
             return
         try:
-            # Match test_deepgram.py params (extra params can cause HTTP 400)
+            # Per Deepgram docs: endpointing=300ms silence → speech_final (faster phrase boundaries)
+            # smart_format → punctuation + readability; interim_results → live partials
             with self._dg_client.listen.v1.connect(
                 model="nova-2",
                 language="en-US",
@@ -259,7 +261,9 @@ class StreamingSTT:
                 sample_rate=str(self.sample_rate),
                 interim_results="true",
                 smart_format="true",
+                endpointing="300",
             ) as socket_client:
+                print("✓ Deepgram connection established")
                 socket_client.on(EventType.MESSAGE, self._on_dg_message)
                 listener_done = threading.Event()
 
@@ -276,12 +280,13 @@ class StreamingSTT:
                 try:
                     while self.running and stream.is_active():
                         try:
-                            data = stream.read(2048, exception_on_overflow=False)
+                            # Smaller, more frequent sends = lower latency for first interim result
+                            data = stream.read(1024, exception_on_overflow=False)
                             if data:
                                 socket_client._send(data)
                         except Exception:
                             pass
-                        time.sleep(0.02)
+                        time.sleep(0.01)
                 finally:
                     try:
                         socket_client._websocket.close()
@@ -289,7 +294,15 @@ class StreamingSTT:
                         pass
                     listener_done.wait(timeout=2.0)
         except Exception as e:
-            print("Deepgram connection error:", e)
+            error_msg = str(e).lower()
+            if "401" in error_msg or "unauthorized" in error_msg:
+                print("Deepgram error: Invalid API key or expired credits")
+                print("  → Check your key at console.deepgram.com")
+            elif "403" in error_msg or "forbidden" in error_msg:
+                print("Deepgram error: No credits remaining")
+                print("  → Add credits at console.deepgram.com")
+            else:
+                print("Deepgram connection error:", e)
             if os.environ.get("DEBUG_STT"):
                 import traceback
                 traceback.print_exc()
