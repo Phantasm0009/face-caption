@@ -99,16 +99,26 @@ class StreamingSTT:
     def start(self) -> bool:
         api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
         if api_key and HAS_DEEPGRAM and HAS_PYAUDIO:
-            try:
-                self._dg_client = DeepgramClient(api_key=api_key)
-                self._use_deepgram = True
-                self._engine = "deepgram"
-                print("STT: Using Deepgram API (live). If no speech appears, check default mic or set DEEPGRAM_INPUT_DEVICE_INDEX.")
-            except Exception as e:
-                print("STT: Deepgram failed ({0}), using next engine.".format(type(e).__name__))
-                if os.environ.get("DEBUG_STT"):
-                    print("  ", e)
-                self._dg_client = None
+            if len(api_key) < 20:
+                print("STT: DEEPGRAM_API_KEY seems invalid (too short). Check your .env file.")
+            else:
+                try:
+                    self._dg_client = DeepgramClient(api_key=api_key)
+                    self._use_deepgram = True
+                    self._engine = "deepgram"
+                    print("STT: Using Deepgram API (live streaming)")
+                    print("     If no speech appears, check:")
+                    print("     1. Microphone permissions")
+                    print("     2. Default input device (set DEEPGRAM_INPUT_DEVICE_INDEX if needed)")
+                    print("     3. API key validity (check Deepgram console)")
+                except Exception as e:
+                    print("STT: Deepgram initialization failed ({0})".format(type(e).__name__))
+                    if os.environ.get("DEBUG_STT"):
+                        print("     Details:", e)
+                    self._dg_client = None
+        elif api_key and not HAS_DEEPGRAM:
+            print("STT: DEEPGRAM_API_KEY is set but deepgram-sdk not installed.")
+            print("     Install with: pip install deepgram-sdk")
         if self._use_deepgram:
             self._thread = threading.Thread(target=self._run_deepgram, daemon=True)
         elif HAS_FASTER_WHISPER and HAS_PYAUDIO and HAS_NUMPY:
@@ -199,21 +209,21 @@ class StreamingSTT:
     def _on_dg_message(self, message):
         """Handle Deepgram SDK 5.x MESSAGE event (ListenV1ResultsEvent)."""
         try:
-            # Skip non-Results (e.g. Metadata, UtteranceEnd)
-            if not getattr(message, "channel", None):
+            if not hasattr(message, "channel") or not message.channel:
                 return
             ch = message.channel
-            if not getattr(ch, "alternatives", None) or not ch.alternatives:
+            if not hasattr(ch, "alternatives") or not ch.alternatives:
                 return
             sentence = (ch.alternatives[0].transcript or "").strip()
             if not sentence:
                 return
-            is_final = getattr(message, "speech_final", None)
-            if is_final is None:
-                is_final = getattr(message, "is_final", True)
+            is_final = getattr(message, "speech_final", False)
+            if not is_final:
+                is_final = getattr(message, "is_final", False)
             self.result_queue.put((sentence, RESULT_FINAL if is_final else RESULT_PARTIAL))
-        except Exception:
-            pass
+        except Exception as e:
+            if os.environ.get("DEBUG_STT"):
+                print("Deepgram message handler error:", e)
 
     def _run_deepgram(self):
         """Send mic audio to Deepgram live connection (SDK 5.x: connect + socket)."""
@@ -241,16 +251,18 @@ class StreamingSTT:
             print("Deepgram: Could not open microphone.", e)
             return
         try:
-            # Required for raw PCM: encoding + sample_rate. Keep optional params minimal to avoid HTTP 400.
+            # Match test_deepgram.py params (extra params can cause HTTP 400)
             with self._dg_client.listen.v1.connect(
                 model="nova-2",
                 language="en-US",
                 encoding="linear16",
                 sample_rate=str(self.sample_rate),
                 interim_results="true",
+                smart_format="true",
             ) as socket_client:
                 socket_client.on(EventType.MESSAGE, self._on_dg_message)
                 listener_done = threading.Event()
+
                 def run_listener():
                     try:
                         socket_client.start_listening()
@@ -258,6 +270,7 @@ class StreamingSTT:
                         pass
                     finally:
                         listener_done.set()
+
                 t = threading.Thread(target=run_listener, daemon=True)
                 t.start()
                 try:
@@ -277,6 +290,9 @@ class StreamingSTT:
                     listener_done.wait(timeout=2.0)
         except Exception as e:
             print("Deepgram connection error:", e)
+            if os.environ.get("DEBUG_STT"):
+                import traceback
+                traceback.print_exc()
         try:
             stream.stop_stream()
             stream.close()

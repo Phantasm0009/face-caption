@@ -591,7 +591,6 @@ def main():
                 display_text = line2 or line1 or ""
         else:
             display_text = displayed_caption if displayed_caption else ""
-        # When translation is on: show current phrase + translation (2 lines)
         if translate_enabled and last_translated and display_text.strip() and display_text != "...":
             display_text = (display_text.split("\n")[-1] if "\n" in display_text else display_text) + "\n(" + last_translated + ")"
         if not display_text.strip():
@@ -619,16 +618,13 @@ def main():
         else:
             frames_since_caption_change += 1
 
-        # Fade-in: ramp alpha for first fade_in_frames when caption changes
         alpha_mult = 1.0
         if fade_in_frames > 0 and frames_since_caption_change < fade_in_frames:
             alpha_mult = 0.5 + 0.5 * (frames_since_caption_change / fade_in_frames)
 
-        # Optional color filter (e.g. thermal/neon) when toggled
         if apply_color_filter:
             frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
 
-        # Predictive positioning: use velocity for lookahead (smoother when moving)
         lookahead_frames = 3
         if face_tracker.initialized and hasattr(face_tracker.kf, "statePost"):
             vx = float(face_tracker.kf.statePost[2, 0])

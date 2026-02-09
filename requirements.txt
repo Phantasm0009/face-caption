@@ -19,4 +19,4 @@ vosk>=0.3.45
 python-dotenv>=1.0.0
 
 # Optional: best quality cloud STT (set DEEPGRAM_API_KEY in .env)
-# deepgram-sdk
+deepgram-sdk>=5.0.0
