@@ -197,17 +197,24 @@ def render_caption_pil(
     fill_color = bg_color if bg_color is not None else CAPTION_BG_COLOR
     img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # Main box (Minecraft-style dark fill)
     draw.rectangle([(0, 0), (total_w - 1, box_h - 1)], fill=fill_color, outline=None)
-    # Enhanced 3D bevel: bright highlight top/left, dark shadow bottom/right (like MC GUI)
     b = CAPTION_BORDER_PX
-    light = (255, 255, 255)
     dark = (0, 0, 0)
     for i in range(b):
-        draw.line([(i, i), (total_w - 1 - i, i)], fill=light)
-        draw.line([(i, i), (i, box_h - 1 - i)], fill=light)
+        draw.line([(i, i), (total_w - 1 - i, i)], fill=(255, 255, 255))
+        draw.line([(i, i), (i, box_h - 1 - i)], fill=(255, 255, 255))
         draw.line([(i, box_h - 1 - i), (total_w - 1 - i, box_h - 1 - i)], fill=dark)
         draw.line([(total_w - 1 - i, i), (total_w - 1 - i, box_h - 1 - i)], fill=dark)
+    fc = fill_color if isinstance(fill_color, (tuple, list)) and len(fill_color) >= 3 else (45, 42, 34)
+    inner_shadow_color = (
+        max(0, fc[0] - 15),
+        max(0, fc[1] - 15),
+        max(0, fc[2] - 15),
+    )
+    for i in range(1):
+        offset = b + i
+        draw.line([(offset, offset), (total_w - 1 - offset, offset)], fill=inner_shadow_color)
+        draw.line([(offset, offset), (offset, box_h - 1 - offset)], fill=inner_shadow_color)
     if speech_bubble and tail_h:
         cx = total_w // 2
         tail_w = 12
@@ -217,7 +224,6 @@ def render_caption_pil(
             outline=None,
         )
         draw.line([(cx - tail_w, total_h - 1), (cx + tail_w, total_h - 1)], fill=dark)
-    # Text with thicker Minecraft-like shadow (dark offset in all directions)
     shadow_fill = (32, 32, 32, 255)
     for i, line in enumerate(lines):
         y = pad + i * line_height
@@ -262,18 +268,26 @@ class FaceKalmanTracker:
         self.kf.measurementMatrix = np.array([
             [1, 0, 0, 0], [0, 1, 0, 0]
         ], dtype=np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1
-        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        # Tuned: lower process noise = smoother, trust predictions more
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.01
+        # Tuned: higher measurement noise = smoother (was 0.1)
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+        # Tuned: better initial uncertainty
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.5
         self.initialized = False
+        self.frames_lost = 0
 
     def update(self, x=None, y=None):
         """Update with measurement (x, y). If x is None, only predict (no face)."""
         if x is None or y is None:
             if not self.initialized:
                 return None, None
+            self.frames_lost += 1
+            if self.frames_lost > 30:
+                self.kf.errorCovPost *= 1.05
             pred = self.kf.predict()
             return float(pred[0, 0]), float(pred[1, 0])
+        self.frames_lost = 0
         measurement = np.array([[np.float32(x)], [np.float32(y)]])
         if not self.initialized:
             self.kf.statePre = np.array([[x], [y], [0], [0]], dtype=np.float32)
@@ -282,6 +296,8 @@ class FaceKalmanTracker:
             return float(x), float(y)
         self.kf.predict()
         estimated = self.kf.correct(measurement)
+        if self.kf.errorCovPost[0, 0] > 1.0:
+            self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.5
         return float(estimated[0, 0]), float(estimated[1, 0])
 
 
@@ -492,7 +508,6 @@ def main():
                     face_center_x, face_top_y = cx, ty
             emotion = emotion_estimator.update(None)
 
-        # Emotion smoothing: require N consecutive frames before switching (reduces jitter)
         if emotion != emotion_hold_prev:
             emotion_hold_frames += 1
             if emotion_hold_frames >= EMOTION_HOLD_FRAMES:
@@ -505,7 +520,6 @@ def main():
 
         face_bbox = last_face_bbox
 
-        # Drain STT queue: partial = live text as you speak; final = replace (only that phrase, no old text)
         try:
             while True:
                 item = text_queue.get_nowait()
@@ -597,16 +611,28 @@ def main():
         if apply_color_filter:
             frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
 
-        cx, ty = int(face_center_x), int(face_top_y)
+        # Predictive positioning: use velocity for lookahead (smoother when moving)
+        lookahead_frames = 3
+        if face_tracker.initialized and hasattr(face_tracker.kf, "statePost"):
+            vx = float(face_tracker.kf.statePost[2, 0])
+            vy = float(face_tracker.kf.statePost[3, 0])
+            cx = int(face_center_x + vx * lookahead_frames)
+            ty = int(face_top_y + vy * lookahead_frames)
+        else:
+            cx = int(face_center_x)
+            ty = int(face_top_y)
         caption_x = cx
         caption_y = ty - CAPTION_OFFSET_ABOVE_HEAD
         if last_caption_render is not None:
             cw = last_caption_render.shape[1]
             ch = last_caption_render.shape[0]
-            # Place caption fully above head: bottom of box = ty - gap, top = ty - gap - height
-            caption_y = ty - ch - CAPTION_OFFSET_ABOVE_HEAD
-            caption_y = max(0, caption_y)  # don't draw off top of frame
-            caption_x = cx - cw // 2
+            dynamic_offset = CAPTION_OFFSET_ABOVE_HEAD
+            if face_bbox is not None:
+                _, _, _, fh = face_bbox
+                dynamic_offset = max(CAPTION_OFFSET_ABOVE_HEAD, int(fh * 0.3))
+            caption_y = ty - ch - dynamic_offset
+            caption_y = max(0, caption_y)
+            caption_x = max(0, min(cx - cw // 2, w - cw))
             frame = overlay_caption_on_frame(
                 frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
             )

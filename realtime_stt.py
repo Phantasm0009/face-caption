@@ -101,7 +101,10 @@ class StreamingSTT:
         if api_key and HAS_DEEPGRAM and HAS_PYAUDIO:
             try:
                 client = DeepgramClient(api_key)
-                self._dg_connection = client.listen.live.v("1")
+                try:
+                    self._dg_connection = client.listen.websocket.v("1")
+                except AttributeError:
+                    self._dg_connection = client.listen.live.v("1")
                 self._dg_connection.on(
                     LiveTranscriptionEvents.Transcript,
                     lambda result, **kwargs: self._on_deepgram_transcript(result, **kwargs),
@@ -112,37 +115,37 @@ class StreamingSTT:
                         language="en-US",
                         smart_format=True,
                         interim_results=True,
-                        utterance_end_ms=1000,
+                        utterance_end_ms=800,
                     )
                 )
                 self._use_deepgram = True
                 self._engine = "deepgram"
+                print("STT: Using Deepgram API (live)")
             except Exception as e:
+                print("STT: Deepgram failed ({0}), using Vosk for speed.".format(type(e).__name__))
                 if os.environ.get("DEBUG_STT"):
-                    print("Deepgram init failed:", e)
+                    print("  ", e)
         if self._use_deepgram:
             self._thread = threading.Thread(target=self._run_deepgram, daemon=True)
-        elif HAS_FASTER_WHISPER and HAS_PYAUDIO and HAS_NUMPY:
-            try:
-                self._model = WhisperModel("base.en", device="cpu", compute_type="int8")
-                self._use_faster_whisper = True
-                self._engine = "faster-whisper"
-            except Exception as e:
-                if os.environ.get("DEBUG_STT"):
-                    print("Faster-whisper init failed:", e)
-        if self._use_faster_whisper:
-            self._thread = threading.Thread(target=self._run_faster_whisper, daemon=True)
         elif HAS_VOSK and HAS_PYAUDIO:
             model_path = _find_vosk_model()
             if model_path:
                 try:
                     self._model = vosk.Model(model_path)
                     self._use_vosk = True
+                    self._engine = "vosk"
+                    self._thread = threading.Thread(target=self._run_vosk, daemon=True)
                 except Exception:
                     pass
-            if self._use_vosk:
-                self._engine = "vosk"
-                self._thread = threading.Thread(target=self._run_vosk, daemon=True)
+        if not self._thread and HAS_FASTER_WHISPER and HAS_PYAUDIO and HAS_NUMPY:
+            try:
+                self._model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+                self._use_faster_whisper = True
+                self._engine = "faster-whisper"
+                self._thread = threading.Thread(target=self._run_faster_whisper, daemon=True)
+            except Exception as e:
+                if os.environ.get("DEBUG_STT"):
+                    print("Faster-whisper init failed:", e)
         if not self._thread:
             if HAS_SR and HAS_PYAUDIO:
                 self._thread = threading.Thread(target=self._run_batch, daemon=True)
@@ -158,7 +161,7 @@ class StreamingSTT:
             self._thread.join(timeout=2.0)
 
     def _run_faster_whisper(self):
-        """Chunked transcription with faster-whisper (better accuracy, similar speed)."""
+        """Short chunks + partial then final so text appears fast (fallback when no Vosk/Deepgram)."""
         p = pyaudio.PyAudio()
         try:
             stream = p.open(
@@ -166,13 +169,13 @@ class StreamingSTT:
                 channels=1,
                 rate=self.sample_rate,
                 input=True,
-                frames_per_buffer=8000,
+                frames_per_buffer=4000,
             )
         except Exception:
             return
-        chunk_duration = 2.0
+        chunk_duration = 0.8
         samples_per_chunk = int(self.sample_rate * chunk_duration)
-        read_size = 4000
+        read_size = 2400
         audio_buffer = []
         while self.running and stream.is_active():
             try:
@@ -190,16 +193,15 @@ class StreamingSTT:
                     beam_size=1,
                     language="en",
                     vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500),
+                    vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=100),
                 )
                 for segment in segments:
                     text = (segment.text or "").strip()
                     if text:
                         self.result_queue.put((text, RESULT_PARTIAL))
-                        time.sleep(0.05)
                         self.result_queue.put((text, RESULT_FINAL))
             except Exception:
-                time.sleep(0.05)
+                time.sleep(0.01)
         try:
             stream.stop_stream()
             stream.close()

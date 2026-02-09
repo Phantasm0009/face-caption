@@ -71,17 +71,33 @@ def create_face_landmarker():
                 print("  ", os.path.join(d, name), file=sys.stderr)
         return None
     try:
-        base_opts = BaseOptions(model_asset_path=path)
-        options = FaceLandmarkerOptions(
-            base_options=base_opts,
-            running_mode=RunningMode.VIDEO,
-            num_faces=1,
-            min_face_detection_confidence=0.3,
-            min_face_presence_confidence=0.3,
-            output_face_blendshapes=True,
-            output_facial_transformation_matrixes=False,
-        )
-        return FaceLandmarker.create_from_options(options)
+        try:
+            base_opts = BaseOptions(
+                model_asset_path=path,
+                delegate=BaseOptions.Delegate.GPU,
+            )
+            options = FaceLandmarkerOptions(
+                base_options=base_opts,
+                running_mode=RunningMode.VIDEO,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                output_face_blendshapes=True,
+                output_facial_transformation_matrixes=False,
+            )
+            return FaceLandmarker.create_from_options(options)
+        except Exception:
+            base_opts = BaseOptions(model_asset_path=path)
+            options = FaceLandmarkerOptions(
+                base_options=base_opts,
+                running_mode=RunningMode.VIDEO,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                output_face_blendshapes=True,
+                output_facial_transformation_matrixes=False,
+            )
+            return FaceLandmarker.create_from_options(options)
     except Exception as e:
         import sys
         print("Face Landmarker: failed to load model:", path, file=sys.stderr)
@@ -134,29 +150,34 @@ def _score(blendshapes, name, idx):
 def emotion_from_blendshapes(blendshapes, smooth_prev=None):
     """
     Infer emotion from MediaPipe face blendshape scores.
-    Returns one of: happy, sad, surprised, angry, neutral.
+    Higher thresholds = fewer false positives; margin check for smooth transitions.
     """
     if not blendshapes:
         return smooth_prev if smooth_prev else "neutral"
-    n = len(blendshapes)
     smile = (_score(blendshapes, BLENDSHAPE_SMILE_LEFT, 44) + _score(blendshapes, BLENDSHAPE_SMILE_RIGHT, 45)) / 2
     jaw_open = _score(blendshapes, BLENDSHAPE_JAW_OPEN, 25)
     brow_down = (_score(blendshapes, BLENDSHAPE_BROW_DOWN_LEFT, 1) + _score(blendshapes, BLENDSHAPE_BROW_DOWN_RIGHT, 2)) / 2
     brow_up = _score(blendshapes, BLENDSHAPE_BROW_INNER_UP, 3)
     frown = (_score(blendshapes, BLENDSHAPE_MOUTH_FROWN_LEFT, 30) + _score(blendshapes, BLENDSHAPE_MOUTH_FROWN_RIGHT, 31)) / 2
 
-    if smile > 0.4:
+    if smile > 0.5:
         emotion = "happy"
-    elif frown > 0.35:
+    elif frown > 0.45:
         emotion = "sad"
-    elif brow_down > 0.4:
+    elif brow_down > 0.5:
         emotion = "angry"
-    elif jaw_open > 0.35 or brow_up > 0.3:
+    elif jaw_open > 0.45 and brow_up > 0.35:
         emotion = "surprised"
     else:
         emotion = "neutral"
 
     if smooth_prev and smooth_prev != emotion:
-        # Optional: require 2 consecutive frames to switch (reduce jitter)
-        pass  # we could add a small state machine here
+        margins = {"happy": 0.6, "sad": 0.55, "angry": 0.6, "surprised": 0.5}
+        threshold = margins.get(emotion, 0.5)
+        if emotion == "happy" and smile < threshold:
+            return smooth_prev
+        if emotion == "sad" and frown < threshold:
+            return smooth_prev
+        if emotion == "angry" and brow_down < threshold:
+            return smooth_prev
     return emotion
