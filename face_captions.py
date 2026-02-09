@@ -14,6 +14,12 @@ import time
 import os
 import sys
 
+# GPU resize if OpenCV built with CUDA (optional)
+try:
+    HAS_CUDA = hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
+except Exception:
+    HAS_CUDA = False
+
 # Load .env so DEEPGRAM_API_KEY (and others) are set before STT starts
 try:
     from dotenv import load_dotenv
@@ -249,19 +255,38 @@ def overlay_caption_on_frame(
     y: int,
     alpha_mult: float = 1.0,
 ) -> np.ndarray:
-    """Blend caption onto frame at (x, y). alpha_mult for fade-in (0..1)."""
+    """Blend caption onto frame at (x, y). Optimized for speed."""
     if caption_rgba is None or caption_rgba.size == 0:
         return frame
     h, w = caption_rgba.shape[:2]
     x = max(0, min(x, frame.shape[1] - w))
     y = max(0, min(y, frame.shape[0] - h))
-    roi = frame[y : y + h, x : x + w]
-    if roi.shape[:2] != (h, w):
+    if x < 0 or y < 0 or x + w > frame.shape[1] or y + h > frame.shape[0]:
         return frame
-    alpha = (caption_rgba[:, :, 3:4] / 255.0) * alpha_mult
+    roi = frame[y : y + h, x : x + w]
+    if alpha_mult >= 0.99:
+        alpha = caption_rgba[:, :, 3:4].astype(np.float32) / 255.0
+    else:
+        alpha = (caption_rgba[:, :, 3:4].astype(np.float32) / 255.0) * alpha_mult
     rgb = caption_rgba[:, :, :3]
-    roi[:] = (alpha * rgb + (1 - alpha) * roi).astype(np.uint8)
+    roi[:] = (alpha * rgb + (1.0 - alpha) * roi).astype(np.uint8)
     return frame
+
+
+def sharpen_frame(frame: np.ndarray, amount: float = 0.3) -> np.ndarray:
+    """Apply unsharp mask to make video crisper."""
+    if amount <= 0:
+        return frame
+    blurred = cv2.GaussianBlur(frame, (3, 3), 0)
+    sharpened = cv2.addWeighted(frame, 1.0 + amount, blurred, -amount, 0)
+    return sharpened
+
+
+def adjust_brightness_contrast(
+    frame: np.ndarray, brightness: int = 5, contrast: float = 1.05
+) -> np.ndarray:
+    """Slightly boost brightness and contrast for better video quality."""
+    return cv2.convertScaleAbs(frame, alpha=contrast, beta=brightness)
 
 
 class FaceKalmanTracker:
@@ -276,9 +301,9 @@ class FaceKalmanTracker:
             [1, 0, 0, 0], [0, 1, 0, 0]
         ], dtype=np.float32)
         # Tuned: trust prediction more = smoother movement
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.005
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.3
-        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.3
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.003
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.25
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.25
         self.initialized = False
         self.frames_lost = 0
 
@@ -317,26 +342,33 @@ class EmotionEstimator:
 
 
 class FrameReader:
-    """Reads latest frame in a thread so main loop always gets freshest frame (smoother video)."""
+    """Reads latest frame in a thread, always drops to newest (lowest latency)."""
     def __init__(self, cap):
         self.cap = cap
         self.lock = threading.Lock()
         self.latest = None
         self.running = True
+        self.frames_captured = 0
+        self.frames_dropped = 0
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self):
         while self.running and self.cap.isOpened():
             ret, frame = self.cap.read()
             if not ret:
+                time.sleep(0.001)
                 continue
             with self.lock:
-                self.latest = frame.copy()
+                if self.latest is not None:
+                    self.frames_dropped += 1
+                self.latest = frame
+                self.frames_captured += 1
 
     def start(self):
         self._thread.start()
 
     def read(self):
+        """Get latest frame (copy to avoid race conditions)."""
         with self.lock:
             if self.latest is not None:
                 return self.latest.copy()
@@ -345,6 +377,10 @@ class FrameReader:
     def stop(self):
         self.running = False
         self._thread.join(timeout=1.0)
+
+    def get_stats(self):
+        with self.lock:
+            return self.frames_captured, self.frames_dropped
 
 
 def main():
@@ -359,7 +395,6 @@ def main():
         print("Could not load face cascade.")
         sys.exit(1)
 
-    # Best camera quality: DirectShow on Windows, try highest resolutions first
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
     cap = cv2.VideoCapture(CAMERA_INDEX, backend)
     if not cap.isOpened():
@@ -368,14 +403,21 @@ def main():
         print("Could not open webcam. Check camera index.")
         sys.exit(1)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    if sys.platform == "win32":
+        try:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        except Exception:
+            pass
     for rw, rh in CAMERA_RESOLUTIONS:
         if rw and rh:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if actual_w >= 320 and actual_h >= 240:
-            print(f"Camera: {actual_w}x{actual_h}")
+        if actual_w >= 640 and actual_h >= 480:
+            print("Camera: {}x{} @ 30fps".format(actual_w, actual_h))
             break
     frame_reader = FrameReader(cap)
     frame_reader.start()
@@ -435,8 +477,10 @@ def main():
     emotion_smooth_prev = "neutral"
     face_tracker = FaceKalmanTracker()
     caption_scale = 1.0
+    debug_mode = False
+    last_debug_time = time.time()
 
-    print("Caption size: + / - keys to resize")
+    print("Caption size: + / - keys to resize (0=100% 1=min 9=max, D=debug)")
 
     # Prefer MediaPipe Face Mesh if model is present (smoother tracking + real emotion)
     face_landmarker_mp = None
@@ -450,18 +494,34 @@ def main():
         print("Face: OpenCV Haar cascade")
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    try:
+        if sys.platform == "win32":
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_OPENGL, cv2.WINDOW_OPENGL)
+    except Exception:
+        pass
 
     disp_w, disp_h = DISPLAY_SIZE
+    render_every_n = 1
+    last_display_frame = None
     while True:
         frame = frame_reader.read()
         if frame is None:
-            time.sleep(0.01)
+            time.sleep(0.001)
             continue
         frame_time_start = time.time()
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         if w > disp_w or h > disp_h:
-            frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+            if HAS_CUDA:
+                try:
+                    gpu_frame = cv2.cuda_GpuMat()
+                    gpu_frame.upload(frame)
+                    gpu_frame = cv2.cuda.resize(gpu_frame, (disp_w, disp_h))
+                    frame = gpu_frame.download()
+                except Exception:
+                    frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
+            else:
+                frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
             h, w = disp_h, disp_w
         if face_center_x == 0 and face_top_y == 0:
             face_center_x, face_top_y = w / 2, h / 3
@@ -470,13 +530,13 @@ def main():
         timestamp_ms = int(frame_count * 1000 / 30)
         rgb_frame = None
 
-        # Adaptive face detection: 1 when searching, 6 when tracking
+        # Adaptive face detection: find fast, then track less often
         if last_face_bbox is None:
             detect_interval = 1
-            detect_scale = 0.50
+            detect_scale = 0.40
         else:
-            detect_interval = 6
-            detect_scale = 0.25
+            detect_interval = 8
+            detect_scale = 0.20
 
         if face_landmarker_mp and (frame_count % detect_interval == 0):
             if rgb_frame is None:
@@ -553,24 +613,28 @@ def main():
         face_bbox = last_face_bbox
 
         try:
-            max_items = 5
+            max_items = 10
             items_processed = 0
+            new_final = False
             while items_processed < max_items:
                 item = text_queue.get_nowait()
                 text, is_final = item if isinstance(item, tuple) and len(item) == 2 else (item, True)
                 text = (text or "").strip()
                 if not text:
+                    items_processed += 1
                     continue
                 if is_final:
                     last_final = text
                     live_partial = ""
-                    if caption_history_lines > 0 and text:
+                    new_final = True
+                    if caption_history_lines > 0:
                         now = time.time()
                         caption_history.append((text, now))
                         if len(caption_history) > caption_history_lines:
                             caption_history.pop(0)
                 else:
-                    live_partial = text
+                    if not new_final:
+                        live_partial = text
                 items_processed += 1
         except queue.Empty:
             pass
@@ -632,11 +696,13 @@ def main():
         scaled_max_width = max(200, int(CAPTION_MAX_WIDTH * caption_scale))
         scaled_padding = max(4, int(CAPTION_BG_PADDING * caption_scale))
         scale_key = round(caption_scale, 2)
-        if display_text != last_caption_text or last_caption_render is None or scale_key != last_caption_scale:
+        scale_changed = abs(scale_key - last_caption_scale) > 0.01
+        if display_text != last_caption_text or last_caption_render is None or scale_changed:
             frames_since_caption_change = 0
             last_caption_text = display_text
             last_caption_scale = scale_key
-            cache_key = (emotion, show_speech_tail, scale_key, hash(display_text[:50]))
+            text_hash = hash(display_text[:50]) if len(display_text) > 30 else display_text
+            cache_key = (emotion, show_speech_tail, scale_key, text_hash)
             if cache_key in caption_cache and caption_cache[cache_key][1] == display_text:
                 last_caption_render = caption_cache[cache_key][0]
             else:
@@ -663,6 +729,9 @@ def main():
 
         if apply_color_filter:
             frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
+        else:
+            frame = sharpen_frame(frame, 0.2)
+            frame = adjust_brightness_contrast(frame, brightness=3, contrast=1.03)
 
         lookahead_frames = 2 if face_bbox is not None else 0
         if lookahead_frames and face_tracker.initialized and hasattr(face_tracker.kf, "statePost"):
@@ -675,26 +744,30 @@ def main():
             ty = int(face_top_y)
         caption_x = cx
         caption_y = ty - CAPTION_OFFSET_ABOVE_HEAD
-        if last_caption_render is not None:
-            cw = last_caption_render.shape[1]
-            ch = last_caption_render.shape[0]
-            dynamic_offset = CAPTION_OFFSET_ABOVE_HEAD
-            if face_bbox is not None:
-                _, _, _, fh = face_bbox
-                dynamic_offset = max(CAPTION_OFFSET_ABOVE_HEAD, int(fh * 0.3))
-            caption_y = ty - ch - dynamic_offset
-            caption_y = max(0, caption_y)
-            caption_x = max(0, min(cx - cw // 2, w - cw))
-            frame = overlay_caption_on_frame(
-                frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
-            )
-            last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
+        if frame_count % render_every_n == 0:
+            if last_caption_render is not None:
+                cw = last_caption_render.shape[1]
+                ch = last_caption_render.shape[0]
+                dynamic_offset = CAPTION_OFFSET_ABOVE_HEAD
+                if face_bbox is not None:
+                    _, _, _, fh = face_bbox
+                    dynamic_offset = max(CAPTION_OFFSET_ABOVE_HEAD, int(fh * 0.3))
+                caption_y = ty - ch - dynamic_offset
+                caption_y = max(0, caption_y)
+                caption_x = max(0, min(cx - cw // 2, w - cw))
+                frame = overlay_caption_on_frame(
+                    frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
+                )
+                last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
+            else:
+                last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
+            if show_face_box and face_bbox:
+                x, y, bw, bh = face_bbox
+                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
+            last_display_frame = frame
         else:
-            last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
-
-        if show_face_box and face_bbox:
-            x, y, bw, bh = face_bbox
-            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
+            if last_display_frame is not None:
+                frame = last_display_frame
 
         frame_time_elapsed = time.time() - frame_time_start
         if frame_time_elapsed > (1.0 / 30) * 1.5:
@@ -704,6 +777,10 @@ def main():
         fps_history.append(current_time)
         fps_history = [t for t in fps_history if current_time - t < 1.0]
         fps = len(fps_history)
+        if debug_mode and (current_time - last_debug_time > 1.0):
+            print("[DEBUG] FPS: {}, Face interval: {}, Cache: {}/{}, Frame: {:.1f}ms".format(
+                fps, detect_interval, len(caption_cache), MAX_CAPTION_CACHE_SIZE, frame_time_elapsed * 1000))
+            last_debug_time = current_time
         if current_time - last_fps_time > 0.5:
             cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit +=/-=size)".format(fps))
             last_fps_time = current_time
@@ -726,13 +803,25 @@ def main():
                 last_translated = ""
                 last_final_translated = ""
         elif key in (ord("+"), ord("=")):
-            caption_scale = min(CAPTION_SCALE_MAX, caption_scale * 1.08)
+            caption_scale = min(CAPTION_SCALE_MAX, caption_scale * 1.12)
             caption_scale = round(caption_scale, 2)
-            print("Caption size: larger ({:.0%})".format(caption_scale))
+            print("Caption size: {:.0%}".format(caption_scale))
         elif key == ord("-"):
-            caption_scale = max(CAPTION_SCALE_MIN, caption_scale * 0.92)
+            caption_scale = max(CAPTION_SCALE_MIN, caption_scale * 0.88)
             caption_scale = round(caption_scale, 2)
-            print("Caption size: smaller ({:.0%})".format(caption_scale))
+            print("Caption size: {:.0%}".format(caption_scale))
+        elif key == ord("0"):
+            caption_scale = 1.0
+            print("Caption size: reset to 100%")
+        elif key == ord("9"):
+            caption_scale = CAPTION_SCALE_MAX
+            print("Caption size: maximum ({:.0%})".format(CAPTION_SCALE_MAX))
+        elif key == ord("1"):
+            caption_scale = CAPTION_SCALE_MIN
+            print("Caption size: minimum ({:.0%})".format(CAPTION_SCALE_MIN))
+        elif key == ord("d"):
+            debug_mode = not debug_mode
+            print("Debug mode: {}".format("ON" if debug_mode else "OFF"))
 
     if stt:
         stt.stop()
