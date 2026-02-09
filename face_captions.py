@@ -289,6 +289,13 @@ def adjust_brightness_contrast(
     return cv2.convertScaleAbs(frame, alpha=contrast, beta=brightness)
 
 
+def enhance_frame(frame: np.ndarray) -> np.ndarray:
+    """Combined sharpening + brightness/contrast in one pass for speed."""
+    blurred = cv2.GaussianBlur(frame, (3, 3), 0)
+    sharpened = cv2.addWeighted(frame, 1.2, blurred, -0.2, 0)
+    return cv2.convertScaleAbs(sharpened, alpha=1.03, beta=3)
+
+
 class FaceKalmanTracker:
     """Smooth face position with a Kalman filter (position + velocity model)."""
     def __init__(self):
@@ -384,6 +391,7 @@ class FrameReader:
 
 
 def main():
+    global HAS_CUDA
     if not HAS_PIL:
         print("Install Pillow: pip install Pillow")
         sys.exit(1)
@@ -501,8 +509,6 @@ def main():
         pass
 
     disp_w, disp_h = DISPLAY_SIZE
-    render_every_n = 1
-    last_display_frame = None
     while True:
         frame = frame_reader.read()
         if frame is None:
@@ -518,7 +524,10 @@ def main():
                     gpu_frame.upload(frame)
                     gpu_frame = cv2.cuda.resize(gpu_frame, (disp_w, disp_h))
                     frame = gpu_frame.download()
-                except Exception:
+                except Exception as e:
+                    if frame_count < 10:
+                        print("GPU resize failed: {}, using CPU".format(e))
+                    HAS_CUDA = False
                     frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
             else:
                 frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
@@ -730,8 +739,7 @@ def main():
         if apply_color_filter:
             frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
         else:
-            frame = sharpen_frame(frame, 0.2)
-            frame = adjust_brightness_contrast(frame, brightness=3, contrast=1.03)
+            frame = enhance_frame(frame)
 
         lookahead_frames = 2 if face_bbox is not None else 0
         if lookahead_frames and face_tracker.initialized and hasattr(face_tracker.kf, "statePost"):
@@ -744,30 +752,25 @@ def main():
             ty = int(face_top_y)
         caption_x = cx
         caption_y = ty - CAPTION_OFFSET_ABOVE_HEAD
-        if frame_count % render_every_n == 0:
-            if last_caption_render is not None:
-                cw = last_caption_render.shape[1]
-                ch = last_caption_render.shape[0]
-                dynamic_offset = CAPTION_OFFSET_ABOVE_HEAD
-                if face_bbox is not None:
-                    _, _, _, fh = face_bbox
-                    dynamic_offset = max(CAPTION_OFFSET_ABOVE_HEAD, int(fh * 0.3))
-                caption_y = ty - ch - dynamic_offset
-                caption_y = max(0, caption_y)
-                caption_x = max(0, min(cx - cw // 2, w - cw))
-                frame = overlay_caption_on_frame(
-                    frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
-                )
-                last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
-            else:
-                last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
-            if show_face_box and face_bbox:
-                x, y, bw, bh = face_bbox
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
-            last_display_frame = frame
+        if last_caption_render is not None:
+            cw = last_caption_render.shape[1]
+            ch = last_caption_render.shape[0]
+            dynamic_offset = CAPTION_OFFSET_ABOVE_HEAD
+            if face_bbox is not None:
+                _, _, _, fh = face_bbox
+                dynamic_offset = max(CAPTION_OFFSET_ABOVE_HEAD, int(fh * 0.3))
+            caption_y = ty - ch - dynamic_offset
+            caption_y = max(0, caption_y)
+            caption_x = max(0, min(cx - cw // 2, w - cw))
+            frame = overlay_caption_on_frame(
+                frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
+            )
+            last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
         else:
-            if last_display_frame is not None:
-                frame = last_display_frame
+            last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
+        if show_face_box and face_bbox:
+            x, y, bw, bh = face_bbox
+            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
 
         frame_time_elapsed = time.time() - frame_time_start
         if frame_time_elapsed > (1.0 / 30) * 1.5:
@@ -778,9 +781,14 @@ def main():
         fps_history = [t for t in fps_history if current_time - t < 1.0]
         fps = len(fps_history)
         if debug_mode and (current_time - last_debug_time > 1.0):
-            print("[DEBUG] FPS: {}, Face interval: {}, Cache: {}/{}, Frame: {:.1f}ms".format(
-                fps, detect_interval, len(caption_cache), MAX_CAPTION_CACHE_SIZE, frame_time_elapsed * 1000))
+            captured, dropped = frame_reader.get_stats()
+            drop_rate = (dropped / captured * 100) if captured > 0 else 0
+            print("[DEBUG] FPS: {:2d} | Interval: {} | Cache: {:2d}/{} | Frame: {:4.1f}ms | Dropped: {:4.1f}%".format(
+                fps, detect_interval, len(caption_cache), MAX_CAPTION_CACHE_SIZE,
+                frame_time_elapsed * 1000, drop_rate))
             last_debug_time = current_time
+        if fps < 20 and frame_count > 100 and frame_count % 300 == 0:
+            print("WARNING: Low FPS ({}). Try: close other apps, reduce camera resolution, or press F to disable fade.".format(fps))
         if current_time - last_fps_time > 0.5:
             cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit +=/-=size)".format(fps))
             last_fps_time = current_time
