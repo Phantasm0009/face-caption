@@ -161,7 +161,7 @@ class StreamingSTT:
             self._thread.join(timeout=2.0)
 
     def _run_faster_whisper(self):
-        """Short chunks + partial then final so text appears fast (fallback when no Vosk/Deepgram)."""
+        """Chunked transcription (1.2s chunks, 75% overlap) for lower latency."""
         p = pyaudio.PyAudio()
         try:
             stream = p.open(
@@ -169,11 +169,11 @@ class StreamingSTT:
                 channels=1,
                 rate=self.sample_rate,
                 input=True,
-                frames_per_buffer=4000,
+                frames_per_buffer=4800,
             )
         except Exception:
             return
-        chunk_duration = 0.8
+        chunk_duration = 1.2
         samples_per_chunk = int(self.sample_rate * chunk_duration)
         read_size = 2400
         audio_buffer = []
@@ -187,18 +187,21 @@ class StreamingSTT:
                 if len(audio_buffer) < samples_per_chunk:
                     continue
                 chunk = np.array(audio_buffer[:samples_per_chunk], dtype=np.float32)
-                audio_buffer = audio_buffer[samples_per_chunk // 2:]
+                audio_buffer = audio_buffer[samples_per_chunk // 4:]
                 segments, _ = self._model.transcribe(
                     chunk,
                     beam_size=1,
                     language="en",
                     vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=100),
+                    vad_parameters=dict(
+                        min_silence_duration_ms=250,
+                        speech_pad_ms=50,
+                    ),
+                    no_speech_threshold=0.5,
                 )
                 for segment in segments:
                     text = (segment.text or "").strip()
                     if text:
-                        self.result_queue.put((text, RESULT_PARTIAL))
                         self.result_queue.put((text, RESULT_FINAL))
             except Exception:
                 time.sleep(0.01)

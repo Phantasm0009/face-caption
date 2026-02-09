@@ -224,13 +224,12 @@ def render_caption_pil(
             outline=None,
         )
         draw.line([(cx - tail_w, total_h - 1), (cx + tail_w, total_h - 1)], fill=dark)
-    shadow_fill = (32, 32, 32, 255)
+    shadow_offsets = [(2, 2), (2, -2), (-2, 2), (-2, -2)]
     for i, line in enumerate(lines):
         y = pad + i * line_height
-        for dx in [-2, -1, 0, 1, 2]:
-            for dy in [-2, -1, 0, 1, 2]:
-                if dx != 0 or dy != 0:
-                    draw.text((pad + dx, y + dy), line, font=font, fill=shadow_fill)
+        for dx, dy in shadow_offsets:
+            draw.text((pad + dx, y + dy), line, font=font, fill=(0, 0, 0, 200))
+        draw.text((pad + 1, y + 1), line, font=font, fill=(0, 0, 0, 255))
         draw.text((pad, y), line, font=font, fill=(255, 255, 255, 255))
     return np.array(img)
 
@@ -410,6 +409,10 @@ def main():
     emotion_hold_prev = "neutral"
     emotion_hold_frames = 0
     window_name = "Face-following captions (Q=quit B=box T=tail H=history F=fade C=color M=translate)"
+    caption_cache = {}
+    MAX_CAPTION_CACHE_SIZE = 10
+    fps_history = []
+    last_fps_time = time.time()
 
     face_center_x, face_top_y = 0.0, 0.0
     last_face_bbox = None
@@ -447,7 +450,10 @@ def main():
         frame_count += 1
         timestamp_ms = int(frame_count * 1000 / 30)
 
-        if face_landmarker_mp and (frame_count % FACE_DETECT_EVERY_N == 0):
+        detect_interval = 2 if last_face_bbox is None else 4
+        detect_scale = 0.50 if last_face_bbox is None else 0.30
+
+        if face_landmarker_mp and (frame_count % detect_interval == 0):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             bbox_mp, landmarks_mp, blendshapes_mp = detect_face(face_landmarker_mp, rgb, timestamp_ms)
             if bbox_mp is not None:
@@ -466,9 +472,9 @@ def main():
                 if cx is not None:
                     face_center_x, face_top_y = cx, ty
                 emotion = emotion_smooth_prev
-        elif frame_count % FACE_DETECT_EVERY_N == 0:
-            small_w = max(80, int(w * FACE_DETECT_SCALE))
-            small_h = max(60, int(h * FACE_DETECT_SCALE))
+        elif frame_count % detect_interval == 0:
+            small_w = max(80, int(w * detect_scale))
+            small_h = max(60, int(h * detect_scale))
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray_small = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
             faces = face_cascade.detectMultiScale(
@@ -591,14 +597,22 @@ def main():
         if display_text != last_caption_text or last_caption_render is None:
             frames_since_caption_change = 0
             last_caption_text = display_text
-            color_name = EMOTIONS.get(emotion, EMOTIONS["neutral"])[1]
-            bg_color = EMOTION_COLORS.get(color_name, CAPTION_BG_COLOR)
-            last_caption_render = render_caption_pil(
-                display_text,
-                CAPTION_FONT_SIZE,
-                bg_color=bg_color,
-                speech_bubble=show_speech_tail,
-            )
+            cache_key = (emotion, show_speech_tail, len(display_text) < 20)
+            if cache_key in caption_cache and caption_cache[cache_key][1] == display_text:
+                last_caption_render = caption_cache[cache_key][0]
+            else:
+                color_name = EMOTIONS.get(emotion, EMOTIONS["neutral"])[1]
+                bg_color = EMOTION_COLORS.get(color_name, CAPTION_BG_COLOR)
+                last_caption_render = render_caption_pil(
+                    display_text,
+                    CAPTION_FONT_SIZE,
+                    bg_color=bg_color,
+                    speech_bubble=show_speech_tail,
+                )
+                if last_caption_render is not None:
+                    if len(caption_cache) >= MAX_CAPTION_CACHE_SIZE:
+                        caption_cache.pop(next(iter(caption_cache)))
+                    caption_cache[cache_key] = (last_caption_render, display_text)
         else:
             frames_since_caption_change += 1
 
@@ -642,6 +656,13 @@ def main():
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
 
         cv2.imshow(window_name, frame)
+        current_time = time.time()
+        fps_history.append(current_time)
+        fps_history = [t for t in fps_history if current_time - t < 1.0]
+        fps = len(fps_history)
+        if current_time - last_fps_time > 0.5:
+            cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit B=box T=tail H=history F=fade C=color M=translate)".format(fps))
+            last_fps_time = current_time
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break

@@ -149,8 +149,7 @@ def _score(blendshapes, name, idx):
 
 def emotion_from_blendshapes(blendshapes, smooth_prev=None):
     """
-    Infer emotion from MediaPipe face blendshape scores.
-    Higher thresholds = fewer false positives; margin check for smooth transitions.
+    Tuned thresholds and hysteresis for stable emotion detection (minimal flickering).
     """
     if not blendshapes:
         return smooth_prev if smooth_prev else "neutral"
@@ -160,24 +159,23 @@ def emotion_from_blendshapes(blendshapes, smooth_prev=None):
     brow_up = _score(blendshapes, BLENDSHAPE_BROW_INNER_UP, 3)
     frown = (_score(blendshapes, BLENDSHAPE_MOUTH_FROWN_LEFT, 30) + _score(blendshapes, BLENDSHAPE_MOUTH_FROWN_RIGHT, 31)) / 2
 
-    if smile > 0.5:
+    if smile > 0.55:
         emotion = "happy"
-    elif frown > 0.45:
-        emotion = "sad"
-    elif brow_down > 0.5:
+    elif brow_down > 0.55 and frown > 0.3:
         emotion = "angry"
-    elif jaw_open > 0.45 and brow_up > 0.35:
+    elif frown > 0.50:
+        emotion = "sad"
+    elif jaw_open > 0.50 and brow_up > 0.40:
         emotion = "surprised"
     else:
         emotion = "neutral"
 
+    hysteresis = 0.08
     if smooth_prev and smooth_prev != emotion:
-        margins = {"happy": 0.6, "sad": 0.55, "angry": 0.6, "surprised": 0.5}
-        threshold = margins.get(emotion, 0.5)
-        if emotion == "happy" and smile < threshold:
+        if emotion == "happy" and smile < 0.55 + hysteresis:
             return smooth_prev
-        if emotion == "sad" and frown < threshold:
+        if emotion == "sad" and frown < 0.50 + hysteresis:
             return smooth_prev
-        if emotion == "angry" and brow_down < threshold:
+        if emotion == "angry" and (brow_down < 0.55 + hysteresis or frown < 0.3):
             return smooth_prev
     return emotion
