@@ -251,61 +251,92 @@ class StreamingSTT:
         except Exception as e:
             print("Deepgram: Could not open microphone.", e)
             return
+        # Use longer WebSocket open timeout (default 10s can fail on slow networks)
+        import websockets.sync.client as _ws_sync
+        _orig_connect = _ws_sync.connect
+        def _connect_long_timeout(uri, *a, open_timeout=30, **kw):
+            return _orig_connect(uri, *a, open_timeout=open_timeout, **kw)
+        _ws_sync.connect = _connect_long_timeout
+        last_error = None
+        max_attempts = 3
         try:
-            # Per Deepgram docs: endpointing=300ms silence → speech_final (faster phrase boundaries)
-            # smart_format → punctuation + readability; interim_results → live partials
-            with self._dg_client.listen.v1.connect(
-                model="nova-2",
-                language="en-US",
-                encoding="linear16",
-                sample_rate=str(self.sample_rate),
-                interim_results="true",
-                smart_format="true",
-                endpointing="300",
-            ) as socket_client:
-                print("✓ Deepgram connection established")
-                socket_client.on(EventType.MESSAGE, self._on_dg_message)
-                listener_done = threading.Event()
-
-                def run_listener():
-                    try:
-                        socket_client.start_listening()
-                    except Exception:
-                        pass
-                    finally:
-                        listener_done.set()
-
-                t = threading.Thread(target=run_listener, daemon=True)
-                t.start()
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    while self.running and stream.is_active():
+                    # Per Deepgram docs: endpointing=300ms silence → speech_final
+                    # smart_format → punctuation; interim_results → live partials
+                    with self._dg_client.listen.v1.connect(
+                        model="nova-2",
+                        language="en-US",
+                        encoding="linear16",
+                        sample_rate=str(self.sample_rate),
+                        interim_results="true",
+                        smart_format="true",
+                        endpointing="300",
+                    ) as socket_client:
+                        print("Deepgram connection established")
+                        socket_client.on(EventType.MESSAGE, self._on_dg_message)
+                        listener_done = threading.Event()
+
+                        def run_listener():
+                            try:
+                                socket_client.start_listening()
+                            except Exception:
+                                pass
+                            finally:
+                                listener_done.set()
+
+                        t = threading.Thread(target=run_listener, daemon=True)
+                        t.start()
                         try:
-                            # Smaller, more frequent sends = lower latency for first interim result
-                            data = stream.read(1024, exception_on_overflow=False)
-                            if data:
-                                socket_client._send(data)
-                        except Exception:
-                            pass
-                        time.sleep(0.01)
-                finally:
-                    try:
-                        socket_client._websocket.close()
-                    except Exception:
-                        pass
-                    listener_done.wait(timeout=2.0)
+                            while self.running and stream.is_active():
+                                try:
+                                    data = stream.read(1024, exception_on_overflow=False)
+                                    if data:
+                                        socket_client._send(data)
+                                except Exception:
+                                    pass
+                                time.sleep(0.01)
+                        finally:
+                            try:
+                                socket_client._websocket.close()
+                            except Exception:
+                                pass
+                            listener_done.wait(timeout=2.0)
+                    break
+                except (TimeoutError, OSError) as e:
+                    last_error = e
+                    if "timed out" in str(e).lower() or isinstance(e, TimeoutError):
+                        if attempt < max_attempts:
+                            print("Deepgram: connection timed out (attempt %d/%d), retrying in 5s..." % (attempt, max_attempts))
+                            time.sleep(5)
+                        else:
+                            print("Deepgram connection error: timed out after %d attempts" % max_attempts)
+                            print("  If this keeps happening: firewall/VPN may block WebSockets.")
+                            print("  For offline captions, unset DEEPGRAM_API_KEY in .env (app will use Vosk or faster-whisper).")
+                    else:
+                        raise
+                except Exception as e:
+                    last_error = e
+                    raise
         except Exception as e:
+            if last_error is not e:
+                last_error = e
             error_msg = str(e).lower()
             if "401" in error_msg or "unauthorized" in error_msg:
                 print("Deepgram error: Invalid API key or expired credits")
-                print("  → Check your key at console.deepgram.com")
+                print("  Check your key at console.deepgram.com")
             elif "403" in error_msg or "forbidden" in error_msg:
                 print("Deepgram error: No credits remaining")
-                print("  → Add credits at console.deepgram.com")
+                print("  Add credits at console.deepgram.com")
             else:
                 print("Deepgram connection error:", e)
+            if "timed out" in error_msg or isinstance(e, TimeoutError):
+                print("  For offline captions, unset DEEPGRAM_API_KEY in .env (uses Vosk or faster-whisper).")
             if os.environ.get("DEBUG_STT"):
                 import traceback
                 traceback.print_exc()
+        finally:
+            _ws_sync.connect = _orig_connect
         try:
             stream.stop_stream()
             stream.close()

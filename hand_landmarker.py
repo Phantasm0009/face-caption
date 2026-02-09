@@ -52,15 +52,21 @@ def _find_model_path():
 def create_hand_landmarker():
     """Create HandLandmarker if MediaPipe Tasks and model are available. Else return None."""
     if not HAS_HAND_TASKS:
+        import sys
+        print("Hand: MediaPipe Tasks API not available (install mediapipe).", file=sys.stderr)
         return None
     path = _find_model_path()
     if not path:
+        import sys
+        print("Hand: model not found. Run: python download_hand_landmarker_model.py", file=sys.stderr)
+        print("  Looked in:", MODEL_DIRS, file=sys.stderr)
         return None
     try:
+        # Use CPU only: packaged MediaPipe often has GPU disabled (ImageCloneCalculator fails).
         try:
             base_opts = BaseOptions(
                 model_asset_path=path,
-                delegate=BaseOptions.Delegate.GPU,
+                delegate=BaseOptions.Delegate.CPU,
             )
         except Exception:
             base_opts = BaseOptions(model_asset_path=path)
@@ -68,12 +74,15 @@ def create_hand_landmarker():
             base_options=base_opts,
             running_mode=RunningMode.VIDEO,
             num_hands=1,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.4,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
         )
         return HandLandmarker.create_from_options(options)
-    except Exception:
+    except Exception as e:
+        import sys
+        print("Hand: failed to load model:", path, file=sys.stderr)
+        print("  ", type(e).__name__, str(e), file=sys.stderr)
         return None
 
 
@@ -93,5 +102,7 @@ def detect_hands(landmarker, frame_rgb, timestamp_ms):
         if not result.hand_landmarks:
             return None
         return result.hand_landmarks
-    except Exception:
+    except Exception as e:
+        import sys
+        print("Hand detect error:", type(e).__name__, e, file=sys.stderr)
         return None

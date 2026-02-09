@@ -110,10 +110,14 @@ CAPTION_BG_PADDING = 12
 CAPTION_BORDER_LIGHT = (90, 85, 72, 255)   # bevel highlight
 CAPTION_BORDER_DARK = (20, 18, 15, 255)    # bevel shadow
 CAPTION_BORDER_PX = 2                        # border width in pixels
-# Pinch-to-scale caption box (hand gesture: pinch in = shrink, pinch out = grow)
+# Pinch-to-scale: expand fingers = bigger caption, pinch in = smaller (direct mapping, no delta)
 CAPTION_SCALE_MIN = 0.55
 CAPTION_SCALE_MAX = 1.85
-PINCH_SENSITIVITY = 0.012   # lower = smaller pinch gesture triggers resize
+# Pinch distance (thumb–index in normalized coords): below = min scale, above = max scale
+PINCH_DIST_MIN = 0.02   # fingers together -> small caption
+PINCH_DIST_MAX = 0.25   # fingers spread (expand/drag out) -> large caption
+CAPTION_PINCH_MARGIN = 80   # pixels around caption that count as "near" for pinch
+PINCH_SCALE_SMOOTH = 0.15   # lerp toward target scale per frame (smoothing)
 # Emotion -> (emoji, color name). Color used to tint the caption box.
 EMOTIONS = {
     "happy": ("😊", "yellow"),
@@ -318,11 +322,6 @@ def _pinch_from_tasks_landmarks(landmarks, frame_w: int, frame_h: int):
     return dist, (cx, cy)
 
 
-# Handle zone: right-bottom corner of caption box (fraction of width/height)
-CAPTION_HANDLE_RIGHT_FRAC = 0.45   # use right 55% of box (bigger = easier to hit)
-CAPTION_HANDLE_BOTTOM_FRAC = 0.40  # use bottom 60% of box
-
-
 class FaceKalmanTracker:
     """Smooth face position with a Kalman filter (position + velocity model)."""
     def __init__(self):
@@ -482,7 +481,7 @@ def main():
     last_final_translated = ""  # which last_final we translated
     emotion_hold_prev = "neutral"
     emotion_hold_frames = 0
-    window_name = "Face captions (Q=quit B=box T=tail H=history F=fade C=color M=translate P=pinch +=/-=size)"
+    window_name = "Face captions (Q=quit B=box T=tail H=history F=fade C=color M=translate P=pinch/expand +=/-=size)"
     caption_cache = {}
     MAX_CAPTION_CACHE_SIZE = 10
     last_caption_scale = 1.0
@@ -516,7 +515,8 @@ def main():
             hand_landmarker = None
     HAS_HANDS = hand_landmarker_tasks is not None or hand_landmarker is not None
     if HAS_HANDS:
-        print("Caption resize: pinch at box corner (P=toggle) or use + / - keys")
+        print("Hand: detected — pinch/expand near caption to resize (green dot = hand seen)")
+        print("Caption resize: expand fingers = bigger, pinch in = smaller; or use + / - keys")
     else:
         print("Caption resize: use + / - keys to change size (run download_hand_landmarker_model.py for pinch)")
 
@@ -572,15 +572,15 @@ def main():
                 if cx is not None:
                     face_center_x, face_top_y = cx, ty
                 emotion = emotion_smooth_prev
-        # Pinch-to-scale only when hand is in the caption box's right-bottom "handle" zone
-        # Use last frame's actual caption position so the zone matches the drawn corner
+        # Pinch-to-scale: work anywhere near the caption (caption box + margin)
         if pinch_enabled and (hand_landmarker_tasks or hand_landmarker):
-            handle_x1, handle_y1, handle_x2, handle_y2 = None, None, None, None
+            zone_x1, zone_y1, zone_x2, zone_y2 = None, None, None, None
             if last_caption_x is not None and last_caption_w is not None and last_caption_h is not None:
-                handle_x1 = last_caption_x + int(last_caption_w * CAPTION_HANDLE_RIGHT_FRAC)
-                handle_y1 = last_caption_y + int(last_caption_h * CAPTION_HANDLE_BOTTOM_FRAC)
-                handle_x2 = last_caption_x + last_caption_w
-                handle_y2 = last_caption_y + last_caption_h
+                margin = CAPTION_PINCH_MARGIN
+                zone_x1 = max(0, last_caption_x - margin)
+                zone_y1 = max(0, last_caption_y - margin)
+                zone_x2 = min(w, last_caption_x + last_caption_w + margin)
+                zone_y2 = min(h, last_caption_y + last_caption_h + margin)
             rgb_hands = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             pinch_dist = None
@@ -596,24 +596,30 @@ def main():
                     center_px = _pinch_center_px(hl, w, h)
                     pinch_dist = _pinch_distance(hl)
 
-            if handle_x1 is not None and center_px is not None:
-                in_handle = (
-                    handle_x1 <= center_px[0] <= handle_x2
-                    and handle_y1 <= center_px[1] <= handle_y2
+            if zone_x1 is not None and center_px is not None:
+                in_zone = (
+                    zone_x1 <= center_px[0] <= zone_x2
+                    and zone_y1 <= center_px[1] <= zone_y2
                 )
-                if in_handle and pinch_dist is not None:
-                    if last_pinch_dist is not None:
-                        delta = pinch_dist - last_pinch_dist
-                        if delta < -PINCH_SENSITIVITY:
-                            caption_scale = max(CAPTION_SCALE_MIN, caption_scale * 0.96)
-                        elif delta > PINCH_SENSITIVITY:
-                            caption_scale = min(CAPTION_SCALE_MAX, caption_scale * 1.04)
-                        caption_scale = max(CAPTION_SCALE_MIN, min(CAPTION_SCALE_MAX, caption_scale))
+                if in_zone and pinch_dist is not None:
+                    # Map pinch distance to scale: expand fingers = bigger, pinch in = smaller
+                    t = (pinch_dist - PINCH_DIST_MIN) / max(1e-6, PINCH_DIST_MAX - PINCH_DIST_MIN)
+                    t = max(0.0, min(1.0, t))
+                    target_scale = CAPTION_SCALE_MIN + t * (CAPTION_SCALE_MAX - CAPTION_SCALE_MIN)
+                    caption_scale = caption_scale + (target_scale - caption_scale) * PINCH_SCALE_SMOOTH
+                    caption_scale = max(CAPTION_SCALE_MIN, min(CAPTION_SCALE_MAX, caption_scale))
                     last_pinch_dist = pinch_dist
                 else:
                     last_pinch_dist = None
             else:
                 last_pinch_dist = None
+
+            # Always show hand feedback when detected (green dot = hand seen; helps debug "not detecting")
+            if center_px is not None:
+                cv2.circle(frame, center_px, 10, (0, 255, 0), 2)
+                if pinch_dist is not None and os.environ.get("DEBUG_PINCH"):
+                    cv2.putText(frame, "Pinch: {:.3f}".format(pinch_dist), (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         else:
             last_pinch_dist = None
         if frame_count % detect_interval == 0:
@@ -804,12 +810,17 @@ def main():
                 frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
             )
             last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
-            # Resize handle hint: always show corner when pinch is on (so user sees where to aim)
+            # Resize handle hint: green when hand in zone (pinch/expand), yellow when hands on, gray when keys-only
             if pinch_enabled:
                 grip_size = max(14, min(cw, ch) // 3)
                 x1, y1 = caption_x + cw - grip_size, caption_y + ch - grip_size
                 x2, y2 = caption_x + cw, caption_y + ch
-                color = (0, 255, 255) if HAS_HANDS else (120, 120, 120)  # bright when active, dim when keys-only
+                if last_pinch_dist is not None:
+                    color = (0, 255, 0)   # green when hand in zone (pinch or expand)
+                elif HAS_HANDS:
+                    color = (0, 255, 255) # yellow when hands enabled but not pinching
+                else:
+                    color = (120, 120, 120)  # gray when hands not available
                 cv2.line(frame, (x1, y2), (x2, y2), color, 2)
                 cv2.line(frame, (x2, y1), (x2, y2), color, 2)
         else:
@@ -825,7 +836,7 @@ def main():
         fps_history = [t for t in fps_history if current_time - t < 1.0]
         fps = len(fps_history)
         if current_time - last_fps_time > 0.5:
-            cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit +=/-=size P=pinch)".format(fps))
+            cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit +=/-=size P=pinch/expand)".format(fps))
             last_fps_time = current_time
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -847,7 +858,7 @@ def main():
                 last_final_translated = ""
         elif key == ord("p"):
             pinch_enabled = not pinch_enabled
-            print("Pinch resize:", "ON (pinch at caption corner)" if pinch_enabled else "OFF")
+            print("Pinch/expand resize:", "ON (expand = bigger, pinch = smaller)" if pinch_enabled else "OFF")
         elif key in (ord("+"), ord("=")):
             caption_scale = min(CAPTION_SCALE_MAX, caption_scale * 1.08)
             caption_scale = round(caption_scale, 2)
