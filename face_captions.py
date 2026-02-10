@@ -56,8 +56,6 @@ except ImportError:
     detect_face = None
     emotion_from_blendshapes = None
 
-# Hand/pinch removed: caption size via + / - keys only (faster)
-
 # Optional translation (pip install googletrans==4.0.0-rc1; may conflict with deepgram's httpcore)
 try:
     from googletrans import Translator
@@ -69,38 +67,27 @@ except (ImportError, AttributeError):
 
 # --- Config ---
 CAMERA_INDEX = 1
-# Bigger, readable captions (large so "I oh" and short phrases are easy to read)
 CAPTION_FONT_SIZE = 52
 CAPTION_MAX_WIDTH = 620
-# Gap between bottom of caption box and top of head (larger = caption sits well above head)
 CAPTION_OFFSET_ABOVE_HEAD = 55
 MAX_CAPTION_LEN = 220
-# Captions disappear after this many seconds (longer = see messages a bit longer)
 CAPTION_TIMEOUT_SEC = 4.5
 EMOTION_SMOOTH = 0.3
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-# Prefer 720p capture = smooth stream (no heavy 1080p resize every frame)
 CAMERA_RESOLUTIONS = [(1280, 720), (1920, 1080), (960, 540), (0, 0)]
-# Max size we process/show (if camera is larger, we resize to this = less lag)
 DISPLAY_SIZE = (1280, 720)
-# Face: smaller scale = faster; adaptive interval (1 when searching, 6 when tracking)
 FACE_DETECT_SCALE = 0.28
 FACE_DETECT_EVERY_N = 6
 FACE_SMOOTH = 0.18
 MAX_CAPTION_LINES = 2
-# Instant captions: show text as soon as it’s said (999 = no typewriter delay)
 REVEAL_CHARS_PER_FRAME = 999
-# Minecraft-style chat background (default when emotion color not used)
-CAPTION_BG_COLOR = (45, 42, 34, 230)  # dark wood/chest tone for Minecraft look
+CAPTION_BG_COLOR = (45, 42, 34, 230)
 CAPTION_BG_PADDING = 12
-# Pixel border for Minecraft GUI look (highlight top/left, shadow bottom/right)
-CAPTION_BORDER_LIGHT = (90, 85, 72, 255)   # bevel highlight
-CAPTION_BORDER_DARK = (20, 18, 15, 255)    # bevel shadow
-CAPTION_BORDER_PX = 2                        # border width in pixels
-# Caption size: + / - keys only (no hand tracking)
+CAPTION_BORDER_LIGHT = (90, 85, 72, 255)
+CAPTION_BORDER_DARK = (20, 18, 15, 255)
+CAPTION_BORDER_PX = 2
 CAPTION_SCALE_MIN = 0.55
 CAPTION_SCALE_MAX = 1.85
-# Emotion -> (emoji, color name). Color used to tint the caption box.
 EMOTIONS = {
     "happy": ("😊", "yellow"),
     "sad": ("😢", "blue"),
@@ -108,23 +95,19 @@ EMOTIONS = {
     "angry": ("😠", "red"),
     "neutral": ("😐", "white"),
 }
-# Emotion-based box tint (RGBA). Makes captions pop by mood.
 EMOTION_COLORS = {
-    "yellow": (45, 45, 15, 220),   # happy
-    "blue": (15, 25, 45, 220),     # sad
-    "orange": (50, 35, 15, 220),  # surprised
-    "red": (50, 20, 20, 220),     # angry
-    "white": (35, 35, 35, 200),   # neutral
+    "yellow": (45, 45, 15, 220),
+    "blue": (15, 25, 45, 220),
+    "orange": (50, 35, 15, 220),
+    "red": (50, 20, 20, 220),
+    "white": (35, 35, 35, 200),
 }
-# UI toggles (can also be toggled live: T=tail, H=history, F=fade, C=color filter, M=translate)
-SHOW_FACE_BOX = False              # Set True to draw green face outline
-SPEECH_BUBBLE_TAIL = True         # Draw a tail on the caption box pointing to head
-CAPTION_HISTORY_LINES = 2         # Exactly 2 lines: top = oldest, bottom = newest (real-time)
-FADE_IN_FRAMES = 1                # Instant feel (0 = instant, 1 = minimal lag)
-# Emotion: require this many consecutive frames before switching (reduces jitter)
+SHOW_FACE_BOX = False
+SPEECH_BUBBLE_TAIL = True
+CAPTION_HISTORY_LINES = 2
+FADE_IN_FRAMES = 1
 EMOTION_HOLD_FRAMES = 3
-# Translation (optional): pip install googletrans==4.0.0-rc1
-TRANSLATION_DEST = "es"           # Target language code when translation is enabled
+TRANSLATION_DEST = "es"
 
 
 def get_minecraft_font(size: int):
@@ -180,13 +163,12 @@ def render_caption_pil(
     max_width: int = None,
     padding: int = None,
 ) -> np.ndarray:
-    """Render text in 2 lines; emotion-tinted box; optional speech-bubble tail. max_width/padding for scale."""
+    """Render caption text in up to 2 lines with emotion-tinted box and optional tail."""
     if not text or not HAS_PIL:
         return None
     font = get_minecraft_font(font_size)
     use_max_width = max_width if max_width is not None else CAPTION_MAX_WIDTH
     pad = padding if padding is not None else CAPTION_BG_PADDING
-    # Two lines only: oldest on top, newest on bottom
     if "\n" in text:
         all_lines = []
         for phrase in text.split("\n"):
@@ -273,22 +255,6 @@ def overlay_caption_on_frame(
     return frame
 
 
-def sharpen_frame(frame: np.ndarray, amount: float = 0.3) -> np.ndarray:
-    """Apply unsharp mask to make video crisper."""
-    if amount <= 0:
-        return frame
-    blurred = cv2.GaussianBlur(frame, (3, 3), 0)
-    sharpened = cv2.addWeighted(frame, 1.0 + amount, blurred, -amount, 0)
-    return sharpened
-
-
-def adjust_brightness_contrast(
-    frame: np.ndarray, brightness: int = 5, contrast: float = 1.05
-) -> np.ndarray:
-    """Slightly boost brightness and contrast for better video quality."""
-    return cv2.convertScaleAbs(frame, alpha=contrast, beta=brightness)
-
-
 def enhance_frame(frame: np.ndarray) -> np.ndarray:
     """Combined sharpening + brightness/contrast in one pass for speed."""
     blurred = cv2.GaussianBlur(frame, (3, 3), 0)
@@ -297,9 +263,7 @@ def enhance_frame(frame: np.ndarray) -> np.ndarray:
 
 
 class FaceKalmanTracker:
-    """Smooth face position with a Kalman filter (position + velocity model)."""
     def __init__(self):
-        # 4 states (x, y, dx, dy), 2 measurements (x, y)
         self.kf = cv2.KalmanFilter(4, 2, 0)
         self.kf.transitionMatrix = np.array([
             [1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]
@@ -307,7 +271,6 @@ class FaceKalmanTracker:
         self.kf.measurementMatrix = np.array([
             [1, 0, 0, 0], [0, 1, 0, 0]
         ], dtype=np.float32)
-        # Tuned: trust prediction more = smoother movement
         self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.003
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.25
         self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.25
@@ -315,7 +278,6 @@ class FaceKalmanTracker:
         self.frames_lost = 0
 
     def update(self, x=None, y=None):
-        """Update with measurement (x, y). If x is None, only predict (no face)."""
         if x is None or y is None:
             if not self.initialized:
                 return None, None
@@ -339,8 +301,6 @@ class FaceKalmanTracker:
 
 
 class EmotionEstimator:
-    """Emotion placeholder when using OpenCV face detection (no landmarks)."""
-
     def __init__(self):
         self.smoothed = "neutral"
 
@@ -349,7 +309,6 @@ class EmotionEstimator:
 
 
 class FrameReader:
-    """Reads latest frame in a thread, always drops to newest (lowest latency)."""
     def __init__(self, cap):
         self.cap = cap
         self.lock = threading.Lock()
@@ -375,7 +334,6 @@ class FrameReader:
         self._thread.start()
 
     def read(self):
-        """Get latest frame (copy to avoid race conditions)."""
         with self.lock:
             if self.latest is not None:
                 return self.latest.copy()
@@ -396,7 +354,6 @@ def main():
         print("Install Pillow: pip install Pillow")
         sys.exit(1)
 
-    # OpenCV built-in face detector (no extra model download)
     face_cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     face_cascade = cv2.CascadeClassifier(face_cascade_path)
     if face_cascade.empty():
@@ -450,7 +407,6 @@ def main():
     else:
         print("Speech: install speech_recognition and PyAudio (and optionally vosk for real-time)")
 
-    # Caption: 2 lines only (oldest top, newest bottom); entries expire after CAPTION_TIMEOUT_SEC
     live_partial = ""
     last_final = ""
     caption_history = []  # list of (text, timestamp)
@@ -468,7 +424,7 @@ def main():
     apply_color_filter = False
     translate_enabled = False
     last_translated = ""
-    last_final_translated = ""  # which last_final we translated
+    last_final_translated = ""
     emotion_hold_prev = "neutral"
     emotion_hold_frames = 0
     window_name = "Face captions (Q=quit B=box T=tail H=history F=fade C=color M=translate +=/-=size)"
@@ -488,9 +444,7 @@ def main():
     debug_mode = False
     last_debug_time = time.time()
 
-    print("Caption size: + / - keys to resize (0=100% 1=min 9=max, D=debug)")
-
-    # Prefer MediaPipe Face Mesh if model is present (smoother tracking + real emotion)
+    print("Caption size: + / - keys (0=100% 1=min 9=max, D=debug)")
     face_landmarker_mp = None
     if HAS_FACE_MESH and create_face_landmarker:
         face_landmarker_mp = create_face_landmarker()
@@ -538,8 +492,6 @@ def main():
         frame_count += 1
         timestamp_ms = int(frame_count * 1000 / 30)
         rgb_frame = None
-
-        # Adaptive face detection: find fast, then track less often
         if last_face_bbox is None:
             detect_interval = 1
             detect_scale = 0.40
@@ -648,14 +600,12 @@ def main():
         except queue.Empty:
             pass
         current_caption = live_partial if live_partial else last_final
-        # Remove placeholders and square/box chars (recognizer artifacts or missing glyphs)
         current_caption = re.sub(r"\s*\[\s*\]\s*", " ", current_caption)
         current_caption = re.sub(r"[\u25A0-\u25AB\u25FB\u25FC\uFFFD]", "", current_caption)  # □ ■ ▢ etc.
         current_caption = re.sub(r"\s+", " ", current_caption).strip()
         if len(current_caption) > MAX_CAPTION_LEN:
             current_caption = current_caption[-MAX_CAPTION_LEN:].strip()
 
-        # Smooth reveal: when caption shrinks (new phrase), reset; else reveal more chars each frame
         target_len = len(current_caption)
         if target_len < reveal_len:
             reveal_len = target_len
@@ -663,7 +613,6 @@ def main():
             reveal_len = min(reveal_len + REVEAL_CHARS_PER_FRAME, target_len)
         displayed_caption = current_caption[:reveal_len]
 
-        # Translation: when enabled, translate last_final once and show with original
         if translate_enabled and HAS_TRANSLATE and _translator and last_final and last_final != last_final_translated:
             try:
                 last_translated = _translator.translate(last_final, dest=TRANSLATION_DEST).text or ""
@@ -675,15 +624,12 @@ def main():
             last_translated = ""
             last_final_translated = ""
 
-        # Exactly 2 lines: top = oldest, bottom = newest (real-time); expire after CAPTION_TIMEOUT_SEC
         now = time.time()
         if caption_history_lines > 0 and caption_history:
-            # Drop expired entries (text goes away after timeout)
             caption_history[:] = [(t, ts) for t, ts in caption_history if now - ts < CAPTION_TIMEOUT_SEC]
             MAX_HISTORY_ENTRIES = 10
             if len(caption_history) > MAX_HISTORY_ENTRIES:
                 caption_history[:] = caption_history[-MAX_HISTORY_ENTRIES:]
-            # At most 2 lines: oldest, newest (newest can be live partial)
             valid = caption_history[-2:]
             line1 = valid[0][0] if len(valid) >= 1 else ""
             line2 = displayed_caption if displayed_caption else (valid[1][0] if len(valid) >= 2 else "")
