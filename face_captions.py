@@ -1145,7 +1145,7 @@ def main():
         elif key == ord("1"):
             caption_scale = CAPTION_SCALE_MIN
             print("Caption size: minimum ({:.0%})".format(CAPTION_SCALE_MIN))
-        el        if key == ord("d"):
+        elif key == ord("d"):
             debug_mode = not debug_mode
             print("Debug mode: {}".format("ON" if debug_mode else "OFF"))
 
