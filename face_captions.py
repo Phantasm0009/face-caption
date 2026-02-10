@@ -5,6 +5,7 @@ Face-following captions: subtitles anchored near your face that follow you.
 - Emotion-based emoji and styling
 """
 
+import argparse
 import cv2
 import numpy as np
 import re
@@ -350,6 +351,15 @@ class FrameReader:
 
 def main():
     global HAS_CUDA
+    parser = argparse.ArgumentParser(description="Face-following captions (webcam + STT)")
+    parser.add_argument(
+        "--obs-mode",
+        action="store_true",
+        help="OBS capture mode: green screen background, always-on-top. Use OBS Window Capture + Chroma Key.",
+    )
+    args = parser.parse_args()
+    obs_mode = args.obs_mode
+
     if not HAS_PIL:
         print("Install Pillow: pip install Pillow")
         sys.exit(1)
@@ -461,6 +471,12 @@ def main():
             cv2.setWindowProperty(window_name, cv2.WND_PROP_OPENGL, cv2.WINDOW_OPENGL)
     except Exception:
         pass
+    if obs_mode:
+        try:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+        except Exception:
+            pass
+        print("OBS mode: green screen. In OBS add Window Capture -> Filters -> Chroma Key (green).")
 
     disp_w, disp_h = DISPLAY_SIZE
     while True:
@@ -714,14 +730,23 @@ def main():
             last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
         else:
             last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
-        if show_face_box and face_bbox:
+        if show_face_box and face_bbox and not obs_mode:
             x, y, bw, bh = face_bbox
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
 
         frame_time_elapsed = time.time() - frame_time_start
         if frame_time_elapsed > (1.0 / 30) * 1.5:
             frame_count += 1
-        cv2.imshow(window_name, frame)
+        if obs_mode:
+            display_frame = np.full((h, w, 3), (0, 255, 0), dtype=np.uint8)
+            if last_caption_render is not None and last_caption_x is not None:
+                display_frame = overlay_caption_on_frame(
+                    display_frame, last_caption_render,
+                    last_caption_x, last_caption_y, alpha_mult=alpha_mult
+                )
+            cv2.imshow(window_name, display_frame)
+        else:
+            cv2.imshow(window_name, frame)
         current_time = time.time()
         fps_history.append(current_time)
         fps_history = [t for t in fps_history if current_time - t < 1.0]
