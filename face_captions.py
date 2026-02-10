@@ -357,8 +357,31 @@ def main():
         action="store_true",
         help="OBS capture mode: green screen background, always-on-top. Use OBS Window Capture + Chroma Key.",
     )
+    parser.add_argument(
+        "--window-size",
+        type=str,
+        default="1280x720",
+        help="Window size in OBS mode (e.g. 800x600, 1280x720).",
+    )
+    parser.add_argument(
+        "--chroma-color",
+        type=str,
+        default="green",
+        choices=["green", "blue", "magenta"],
+        help="Background color for chroma keying in OBS mode.",
+    )
     args = parser.parse_args()
     obs_mode = args.obs_mode
+    if "x" in args.window_size:
+        try:
+            ws, hs = args.window_size.strip().lower().split("x")
+            OBS_WINDOW_SIZE = (int(ws), int(hs))
+        except ValueError:
+            OBS_WINDOW_SIZE = DISPLAY_SIZE
+    else:
+        OBS_WINDOW_SIZE = DISPLAY_SIZE
+    CHROMA_BGR = {"green": (0, 255, 0), "blue": (255, 0, 0), "magenta": (255, 0, 255)}
+    obs_chroma_bgr = CHROMA_BGR.get(args.chroma_color, (0, 255, 0))
 
     if not HAS_PIL:
         print("Install Pillow: pip install Pillow")
@@ -698,10 +721,11 @@ def main():
         if fade_in_frames > 0 and frames_since_caption_change < fade_in_frames:
             alpha_mult = 0.5 + 0.5 * (frames_since_caption_change / fade_in_frames)
 
-        if apply_color_filter:
-            frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
-        else:
-            frame = enhance_frame(frame)
+        if not obs_mode:
+            if apply_color_filter:
+                frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
+            else:
+                frame = enhance_frame(frame)
 
         lookahead_frames = 2 if face_bbox is not None else 0
         if lookahead_frames and face_tracker.initialized and hasattr(face_tracker.kf, "statePost"):
@@ -738,11 +762,30 @@ def main():
         if frame_time_elapsed > (1.0 / 30) * 1.5:
             frame_count += 1
         if obs_mode:
-            display_frame = np.full((h, w, 3), (0, 255, 0), dtype=np.uint8)
+            w_obs, h_obs = OBS_WINDOW_SIZE
+            display_frame = np.full((h_obs, w_obs, 3), obs_chroma_bgr, dtype=np.uint8)
+            if debug_mode:
+                for i in range(0, w_obs, 100):
+                    cv2.line(display_frame, (i, 0), (i, h_obs), tuple(max(0, c - 55) for c in obs_chroma_bgr), 1)
+                for i in range(0, h_obs, 100):
+                    cv2.line(display_frame, (0, i), (w_obs, i), tuple(max(0, c - 55) for c in obs_chroma_bgr), 1)
             if last_caption_render is not None and last_caption_x is not None:
+                cw, ch = last_caption_w, last_caption_h
+                if w_obs != w or h_obs != h:
+                    sx, sy = w_obs / max(1, w), h_obs / max(1, h)
+                    cx_obs = int(last_caption_x * sx)
+                    cy_obs = int(last_caption_y * sy)
+                    cw_obs = int(cw * sx)
+                    ch_obs = int(ch * sy)
+                    caption_scaled = cv2.resize(last_caption_render, (max(1, cw_obs), max(1, ch_obs)), interpolation=cv2.INTER_LINEAR)
+                else:
+                    cx_obs, cy_obs = last_caption_x, last_caption_y
+                    caption_scaled = last_caption_render
+                    cw_obs, ch_obs = cw, ch
+                cx_obs = max(0, min(cx_obs, w_obs - cw_obs))
+                cy_obs = max(0, min(cy_obs, h_obs - ch_obs))
                 display_frame = overlay_caption_on_frame(
-                    display_frame, last_caption_render,
-                    last_caption_x, last_caption_y, alpha_mult=alpha_mult
+                    display_frame, caption_scaled, cx_obs, cy_obs, alpha_mult=alpha_mult
                 )
             cv2.imshow(window_name, display_frame)
         else:
