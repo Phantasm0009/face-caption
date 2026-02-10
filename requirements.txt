@@ -20,3 +20,6 @@ python-dotenv>=1.0.0
 
 # Optional: best quality cloud STT (set DEEPGRAM_API_KEY in .env)
 deepgram-sdk>=5.0.0
+
+# Optional: WebSocket control API (--enable-api for Stream Deck / automation)
+websockets>=12.0

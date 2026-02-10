@@ -106,6 +106,12 @@ python face_captions.py --obs-mode --window-size 800x600
 python face_captions.py --obs-mode --chroma-color blue
 ```
 
+OBS window position and caption offsets are saved to `obs_window.json` on quit and restored on next run.
+
+**Performance overlay** (FPS, face, STT on frame): `--show-perf` or press **D** for debug.
+
+**WebSocket control API** (e.g. Stream Deck): `pip install websockets` then `python face_captions.py --enable-api` (default port 8765). Send JSON: `{"action": "toggle_speech_bubble"}`, `{"action": "set_caption_offset", "x": 0, "y": -10}`.
+
 See [OBS / Streaming](#obs--streaming) and **OBS_SETUP.md** for full instructions.
 
 ---

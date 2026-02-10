@@ -6,6 +6,7 @@ Face-following captions: subtitles anchored near your face that follow you.
 """
 
 import argparse
+import json
 import cv2
 import numpy as np
 import re
@@ -14,6 +15,15 @@ import queue
 import time
 import os
 import sys
+from collections import OrderedDict
+
+# Optional WebSocket control API
+try:
+    import asyncio
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
 
 # GPU resize if OpenCV built with CUDA (optional)
 try:
@@ -66,8 +76,8 @@ except (ImportError, AttributeError):
     _translator = None
     HAS_TRANSLATE = False
 
-# --- Config ---
-CAMERA_INDEX = 1
+# --- Config (overridden by config.json and CLI) ---
+CAMERA_INDEX = 0
 CAPTION_FONT_SIZE = 52
 CAPTION_MAX_WIDTH = 620
 CAPTION_OFFSET_ABOVE_HEAD = 55
@@ -337,7 +347,10 @@ class FrameReader:
     def read(self):
         with self.lock:
             if self.latest is not None:
-                return self.latest.copy()
+                try:
+                    return self.latest.copy()
+                except Exception:
+                    return None
         return None
 
     def stop(self):
@@ -347,6 +360,170 @@ class FrameReader:
     def get_stats(self):
         with self.lock:
             return self.frames_captured, self.frames_dropped
+
+
+def get_script_dir():
+    """Directory containing this script (for config, OBS state, etc.)."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_obs_window_state():
+    """Load OBS window position/size and caption offsets from obs_window.json. Returns dict or None."""
+    path = os.path.join(get_script_dir(), "obs_window.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_obs_window_state(window_name, caption_offset_x, caption_offset_y, window_size):
+    """Save OBS window position (if available), size, and caption offsets to obs_window.json."""
+    out = {
+        "caption_offset_x": caption_offset_x,
+        "caption_offset_y": caption_offset_y,
+        "window_width": window_size[0],
+        "window_height": window_size[1],
+    }
+    try:
+        WND_X = getattr(cv2, "WND_PROP_POS_X", -1)
+        WND_Y = getattr(cv2, "WND_PROP_POS_Y", -1)
+        if WND_X >= 0 and WND_Y >= 0:
+            x = int(cv2.getWindowProperty(window_name, WND_X))
+            y = int(cv2.getWindowProperty(window_name, WND_Y))
+            if x >= 0 and y >= 0:
+                out["window_x"] = x
+                out["window_y"] = y
+    except Exception:
+        pass
+    path = os.path.join(get_script_dir(), "obs_window.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+    except Exception:
+        pass
+
+
+def draw_perf_overlay(frame, fps, face_detected, stt_active):
+    """Draw a small performance panel (FPS, face, STT) on the frame. Modifies frame in place."""
+    h, w = frame.shape[:2]
+    pad = 8
+    line_h = 22
+    panel_w = 160
+    panel_h = pad * 2 + line_h * 3
+    x0, y0 = pad, pad
+    overlay = frame[y0 : y0 + panel_h, x0 : x0 + panel_w]
+    if overlay.size == 0:
+        return
+    # Semi-transparent dark background
+    cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (40, 40, 40), -1)
+    cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (100, 100, 100), 1)
+    color_fps = (0, 255, 0) if fps >= 24 else (0, 200, 255) if fps >= 18 else (0, 0, 255)
+    cv2.putText(frame, "FPS: {}".format(fps), (x0 + pad, y0 + pad + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_fps, 1, cv2.LINE_AA)
+    face_txt = "Face: yes" if face_detected else "Face: no"
+    cv2.putText(frame, face_txt, (x0 + pad, y0 + pad + 16 + line_h),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+    stt_txt = "STT: on" if stt_active else "STT: off"
+    cv2.putText(frame, stt_txt, (x0 + pad, y0 + pad + 16 + line_h * 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+
+def _run_ws_server(port, command_queue):
+    """Run WebSocket server in a thread; push received JSON commands into command_queue."""
+    if not HAS_WEBSOCKETS:
+        return
+
+    async def handler(websocket, path):
+        try:
+            async for raw in websocket:
+                try:
+                    msg = json.loads(raw)
+                    command_queue.put(msg)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        except Exception:
+            pass
+
+    async def serve():
+        async with websockets.serve(handler, "127.0.0.1", port, ping_interval=None):
+            await asyncio.Future()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(serve())
+    except Exception:
+        pass
+    finally:
+        loop.close()
+
+
+def start_control_api(port=8765, command_queue=None):
+    """Start WebSocket control API in a daemon thread. Commands are put into command_queue."""
+    if not HAS_WEBSOCKETS or command_queue is None:
+        return None
+    t = threading.Thread(target=_run_ws_server, args=(port, command_queue), daemon=True)
+    t.start()
+    return t
+
+
+def load_config():
+    """Load config.json; create with defaults if missing."""
+    script_dir = get_script_dir()
+    config_path = os.path.join(script_dir, "config.json")
+    defaults = {
+        "camera_index": 0,
+        "caption_font_size": 52,
+        "caption_max_width": 620,
+        "obs_mode_default_size": "1280x720",
+        "show_face_box": False,
+        "speech_bubble_tail": True,
+        "caption_history_lines": 2,
+        "chroma_color": "green",
+    }
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return {**defaults, **json.load(f)}
+        except Exception:
+            pass
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(defaults, f, indent=2)
+    except Exception:
+        pass
+    return defaults
+
+
+def find_camera():
+    """Try indices 0-4 and return the first working camera."""
+    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+    for idx in range(5):
+        cap = cv2.VideoCapture(idx, backend)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            cap.release()
+            if ret and frame is not None:
+                return idx
+    return 0
+
+
+def show_obs_setup_wizard(window_name):
+    """Print OBS setup steps once per install."""
+    print("\n" + "=" * 60)
+    print("OBS SETUP")
+    print("=" * 60)
+    print("\n1. Open OBS Studio")
+    print("2. Add source: [+] in Sources -> Window Capture")
+    print("   Name: Face Captions")
+    print("   Window: " + window_name)
+    print("\n3. Remove green: Right-click source -> Filters -> + -> Chroma Key")
+    print("   Key Color: Green  |  Similarity: 400-500  |  Smoothness: 80-100")
+    print("\n4. Position the source in your scene, then start speaking.")
+    print("=" * 60)
 
 
 def main():
@@ -366,12 +543,56 @@ def main():
     parser.add_argument(
         "--chroma-color",
         type=str,
-        default="green",
+        default=None,
         choices=["green", "blue", "magenta"],
         help="Background color for chroma keying in OBS mode.",
     )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=None,
+        help="Camera device index (overrides config).",
+    )
+    parser.add_argument(
+        "--caption-offset-x",
+        type=int,
+        default=0,
+        help="Horizontal caption offset in pixels.",
+    )
+    parser.add_argument(
+        "--caption-offset-y",
+        type=int,
+        default=0,
+        help="Vertical caption offset in pixels (negative = up).",
+    )
+    parser.add_argument(
+        "--performance-mode",
+        choices=["auto", "high", "balanced", "low"],
+        default="balanced",
+        help="Performance preset (low = smaller resolution, less detection).",
+    )
+    parser.add_argument(
+        "--enable-api",
+        action="store_true",
+        help="Start WebSocket control API on 127.0.0.1 (requires: pip install websockets).",
+    )
+    parser.add_argument(
+        "--api-port",
+        type=int,
+        default=8765,
+        help="Port for WebSocket control API (default 8765).",
+    )
+    parser.add_argument(
+        "--show-perf",
+        action="store_true",
+        help="Show performance overlay (FPS / face / STT) on the video frame.",
+    )
     args = parser.parse_args()
     obs_mode = args.obs_mode
+    caption_offset_x = args.caption_offset_x
+    caption_offset_y = args.caption_offset_y
+    config = load_config()
+    chroma_color = args.chroma_color or config.get("chroma_color", "green")
     if "x" in args.window_size:
         try:
             ws, hs = args.window_size.strip().lower().split("x")
@@ -381,7 +602,25 @@ def main():
     else:
         OBS_WINDOW_SIZE = DISPLAY_SIZE
     CHROMA_BGR = {"green": (0, 255, 0), "blue": (255, 0, 0), "magenta": (255, 0, 255)}
-    obs_chroma_bgr = CHROMA_BGR.get(args.chroma_color, (0, 255, 0))
+    obs_chroma_bgr = CHROMA_BGR.get(chroma_color, (0, 255, 0))
+
+    if args.camera_index is not None:
+        camera_index = args.camera_index
+    else:
+        cfg_cam = config.get("camera_index", 0)
+        camera_index = find_camera() if cfg_cam == "auto" else int(cfg_cam)
+
+    PERFORMANCE_PRESETS = {
+        "high": {"display_size": (1920, 1080), "detect_interval_tracking": 8, "caption_cache_size": 20, "enhance_frame": True},
+        "balanced": {"display_size": (1280, 720), "detect_interval_tracking": 8, "caption_cache_size": 20, "enhance_frame": True},
+        "low": {"display_size": (960, 540), "detect_interval_tracking": 12, "caption_cache_size": 10, "enhance_frame": False},
+    }
+    perf_mode = args.performance_mode if args.performance_mode != "auto" else "balanced"
+    perf = PERFORMANCE_PRESETS.get(perf_mode, PERFORMANCE_PRESETS["balanced"])
+    disp_w_cfg, disp_h_cfg = perf["display_size"]
+    detect_interval_tracking = perf["detect_interval_tracking"]
+    caption_cache_size = perf["caption_cache_size"]
+    enhance_frame_enabled = perf["enhance_frame"]
 
     if not HAS_PIL:
         print("Install Pillow: pip install Pillow")
@@ -394,11 +633,24 @@ def main():
         sys.exit(1)
 
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-    cap = cv2.VideoCapture(CAMERA_INDEX, backend)
+    cap = cv2.VideoCapture(camera_index, backend)
     if not cap.isOpened():
-        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print("Could not open webcam. Check camera index.")
+        print("ERROR: Could not open webcam (index {}).".format(camera_index))
+        print("\nTroubleshooting:")
+        print("  1. Close other apps using the camera (Zoom, Teams, etc.)")
+        print("  2. Check camera permissions in System Settings")
+        print("  3. Try: python face_captions.py --camera-index 0")
+        print("  4. Try: python face_captions.py --camera-index 1")
+        print("\nAvailable camera indices:")
+        for i in range(5):
+            test = cv2.VideoCapture(i, backend)
+            if test.isOpened():
+                test.release()
+                print("  - Camera {}: available".format(i))
+            else:
+                print("  - Camera {}: not available".format(i))
         sys.exit(1)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FPS, 30)
@@ -415,7 +667,7 @@ def main():
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if actual_w >= 640 and actual_h >= 480:
-            print("Camera: {}x{} @ 30fps".format(actual_w, actual_h))
+            print("Camera: {}x{} @ 30fps (index {})".format(actual_w, actual_h, camera_index))
             break
     frame_reader = FrameReader(cap)
     frame_reader.start()
@@ -461,8 +713,8 @@ def main():
     emotion_hold_prev = "neutral"
     emotion_hold_frames = 0
     window_name = "Face captions (Q=quit B=box T=tail H=history F=fade C=color M=translate +=/-=size)"
-    caption_cache = {}
-    MAX_CAPTION_CACHE_SIZE = 20
+    caption_cache = OrderedDict()
+    MAX_CAPTION_CACHE_SIZE = caption_cache_size
     last_caption_scale = 1.0
     last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
     fps_history = []
@@ -477,6 +729,7 @@ def main():
     debug_mode = False
     last_debug_time = time.time()
 
+    print("Performance: {} ({}x{})".format(perf_mode, disp_w_cfg, disp_h_cfg))
     print("Caption size: + / - keys (0=100% 1=min 9=max, D=debug)")
     face_landmarker_mp = None
     if HAS_FACE_MESH and create_face_landmarker:
@@ -487,6 +740,14 @@ def main():
             print("Face: MediaPipe model not found; run download_face_landmarker_model.py")
     if not face_landmarker_mp:
         print("Face: OpenCV Haar cascade")
+
+    api_command_queue = queue.Queue() if args.enable_api else None
+    if args.enable_api:
+        if HAS_WEBSOCKETS:
+            start_control_api(port=args.api_port, command_queue=api_command_queue)
+            print("Control API: ws://127.0.0.1:{} (JSON: action, toggle_speech_bubble, set_caption_offset, etc.)".format(args.api_port))
+        else:
+            print("Control API: install websockets (pip install websockets) to enable.")
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     try:
@@ -499,10 +760,50 @@ def main():
             cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
         except Exception:
             pass
-        print("OBS mode: green screen. In OBS add Window Capture -> Filters -> Chroma Key (green).")
+        obs_state = load_obs_window_state()
+        if obs_state:
+            try:
+                x, y = obs_state.get("window_x"), obs_state.get("window_y")
+                if x is not None and y is not None and x >= 0 and y >= 0:
+                    cv2.moveWindow(window_name, int(x), int(y))
+                ww, wh = obs_state.get("window_width"), obs_state.get("window_height")
+                if ww and wh:
+                    cv2.resizeWindow(window_name, int(ww), int(wh))
+                if "caption_offset_x" in obs_state:
+                    caption_offset_x = int(obs_state["caption_offset_x"])
+                if "caption_offset_y" in obs_state:
+                    caption_offset_y = int(obs_state["caption_offset_y"])
+            except Exception:
+                pass
+        print("OBS mode: {}x{} ({} chroma). In OBS: Window Capture -> Chroma Key.".format(
+            OBS_WINDOW_SIZE[0], OBS_WINDOW_SIZE[1], chroma_color))
 
-    disp_w, disp_h = DISPLAY_SIZE
+    disp_w, disp_h = (disp_w_cfg, disp_h_cfg)
+    if obs_mode:
+        if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".obs_setup_done")):
+            show_obs_setup_wizard(window_name)
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".obs_setup_done"), "w") as _:
+                    _.write("1")
+            except Exception:
+                pass
     while True:
+        if api_command_queue is not None:
+            while not api_command_queue.empty():
+                try:
+                    cmd = api_command_queue.get_nowait()
+                    action = (cmd or {}).get("action")
+                    if action == "toggle_speech_bubble":
+                        show_speech_tail = not show_speech_tail
+                    elif action == "set_caption_offset":
+                        if "x" in cmd:
+                            caption_offset_x = int(cmd["x"])
+                        if "y" in cmd:
+                            caption_offset_y = int(cmd["y"])
+                    elif action == "set_theme" and "theme" in cmd:
+                        pass  # placeholder for future theme support
+                except (queue.Empty, TypeError, ValueError, KeyError):
+                    break
         frame = frame_reader.read()
         if frame is None:
             time.sleep(0.001)
@@ -535,7 +836,7 @@ def main():
             detect_interval = 1
             detect_scale = 0.40
         else:
-            detect_interval = 8
+            detect_interval = detect_interval_tracking
             detect_scale = 0.20
 
         if face_landmarker_mp and (frame_count % detect_interval == 0):
@@ -699,6 +1000,7 @@ def main():
             cache_key = (emotion, show_speech_tail, scale_key, text_hash)
             if cache_key in caption_cache and caption_cache[cache_key][1] == display_text:
                 last_caption_render = caption_cache[cache_key][0]
+                caption_cache.move_to_end(cache_key)
             else:
                 color_name = EMOTIONS.get(emotion, EMOTIONS["neutral"])[1]
                 bg_color = EMOTION_COLORS.get(color_name, CAPTION_BG_COLOR)
@@ -712,7 +1014,7 @@ def main():
                 )
                 if last_caption_render is not None:
                     if len(caption_cache) >= MAX_CAPTION_CACHE_SIZE:
-                        caption_cache.pop(next(iter(caption_cache)))
+                        caption_cache.popitem(last=False)
                     caption_cache[cache_key] = (last_caption_render, display_text)
         else:
             frames_since_caption_change += 1
@@ -721,7 +1023,7 @@ def main():
         if fade_in_frames > 0 and frames_since_caption_change < fade_in_frames:
             alpha_mult = 0.5 + 0.5 * (frames_since_caption_change / fade_in_frames)
 
-        if not obs_mode:
+        if not obs_mode and enhance_frame_enabled:
             if apply_color_filter:
                 frame = cv2.applyColorMap(frame, cv2.COLORMAP_HOT)
             else:
@@ -746,8 +1048,8 @@ def main():
                 _, _, _, fh = face_bbox
                 dynamic_offset = max(CAPTION_OFFSET_ABOVE_HEAD, int(fh * 0.3))
             caption_y = ty - ch - dynamic_offset
-            caption_y = max(0, caption_y)
-            caption_x = max(0, min(cx - cw // 2, w - cw))
+            caption_y = max(0, caption_y) + caption_offset_y
+            caption_x = max(0, min(cx - cw // 2, w - cw)) + caption_offset_x
             frame = overlay_caption_on_frame(
                 frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
             )
@@ -794,6 +1096,8 @@ def main():
         fps_history.append(current_time)
         fps_history = [t for t in fps_history if current_time - t < 1.0]
         fps = len(fps_history)
+        if (debug_mode or args.show_perf) and not obs_mode:
+            draw_perf_overlay(frame, fps, last_face_bbox is not None, stt is not None)
         if debug_mode and (current_time - last_debug_time > 1.0):
             captured, dropped = frame_reader.get_stats()
             drop_rate = (dropped / captured * 100) if captured > 0 else 0
@@ -803,7 +1107,7 @@ def main():
             last_debug_time = current_time
         if fps < 20 and frame_count > 100 and frame_count % 300 == 0:
             print("WARNING: Low FPS ({}). Try: close other apps, reduce camera resolution, or press F to disable fade.".format(fps))
-        if current_time - last_fps_time > 0.5:
+        if current_time - last_fps_time > 2.0:
             cv2.setWindowTitle(window_name, "Face Captions — {0} FPS (Q=quit +=/-=size)".format(fps))
             last_fps_time = current_time
         key = cv2.waitKey(1) & 0xFF
@@ -841,10 +1145,12 @@ def main():
         elif key == ord("1"):
             caption_scale = CAPTION_SCALE_MIN
             print("Caption size: minimum ({:.0%})".format(CAPTION_SCALE_MIN))
-        elif key == ord("d"):
+        el        if key == ord("d"):
             debug_mode = not debug_mode
             print("Debug mode: {}".format("ON" if debug_mode else "OFF"))
 
+    if obs_mode:
+        save_obs_window_state(window_name, caption_offset_x, caption_offset_y, OBS_WINDOW_SIZE)
     if stt:
         stt.stop()
     frame_reader.stop()
