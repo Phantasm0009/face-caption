@@ -1,6 +1,6 @@
 # Face-Following Captions
 
-Real-time speech captions that follow your face. A Python app using your webcam, face tracking, and streaming speech-to-text—with a Minecraft-style look and optional emotion-based styling.
+Real-time speech captions that follow your face. A Python app using your webcam, face tracking, and streaming speech-to-text—with **Minecraft** or **Cyberpunk 2077** caption styles and optional emotion-based styling.
 
 ---
 
@@ -22,9 +22,9 @@ Real-time speech captions that follow your face. A Python app using your webcam,
 
 | Feature | Description |
 |--------|-------------|
-| **Face-following** | Captions stay above your head and move with you. |
+| **Face-following** | Captions stay above your head and move smoothly with you (position smoothing). |
 | **Real-time STT** | Streaming captions (Deepgram, Vosk, or faster-whisper) or fast batch (Google). |
-| **Minecraft style** | Chat-style font and box; place `Minecraft.ttf` in the project or `fonts/` folder. |
+| **Caption styles** | **Minecraft** or **Cyberpunk 2077**; set `caption_style` in `config.json`. Use `cyberpunk_font` to pick a font (Rajdhani, Orbitron, etc.). |
 | **Emotion colors** | With MediaPipe Face Mesh, caption tint reflects expression (happy, sad, etc.). |
 | **Face tracking** | MediaPipe Face Landmarker when available; otherwise OpenCV Haar cascade. |
 | **OBS-ready** | `--obs-mode` for green-screen overlay; use Window Capture + Chroma Key in OBS. |
@@ -82,13 +82,14 @@ python download_face_landmarker_model.py
 
 Puts the model in `models/`. Without it, the app uses OpenCV’s face detector and neutral emotion.
 
-### Minecraft font (optional)
+### Fonts (optional)
 
-Place `Minecraft.ttf` in the project folder or in `fonts/`. Otherwise a system font is used.
+- **Minecraft style**: Place `Minecraft.ttf` in the project folder or `fonts/`. Otherwise a system font is used.
+- **Cyberpunk style**: Set `cyberpunk_font` in `config.json` (e.g. `"Rajdhani-Regular.ttf"`, `"Orbitron-Regular.ttf"`, `"Cyberpunk-Regular.ttf"`). Place the `.ttf` in the project root or `fonts/`. Use `null` for the default search order.
 
 ### Different camera
 
-Set `CAMERA_INDEX` in `face_captions.py` (e.g. `1`), or use `list_mics.py`-style helpers if you add a camera list script. On Windows you can also try different indices (0, 1, 2).
+Set `camera_index` in `config.json` (0, 1, 2…). Run `python list_mics.py` to see microphone indices. For cameras, try different indices (0, 1, 2) until one works.
 
 ---
 
@@ -107,6 +108,8 @@ python face_captions.py --obs-mode --chroma-color blue
 ```
 
 OBS window position and caption offsets are saved to `obs_window.json` on quit and restored on next run.
+
+**Performance mode**: `--performance-mode high|balanced|low` (default: balanced). Use `low` for slower PCs.
 
 **Performance overlay** (FPS, face, STT on frame): `--show-perf` or press **D** for debug.
 
@@ -142,9 +145,7 @@ Use the app as a **caption overlay** in OBS:
 
 1. Run: `python face_captions.py --obs-mode`
 2. In OBS: **Add source → Window Capture** → select the “Face captions” window
-3. Right-click source → **Filters → Chroma Key** → set color to green (or match `--chroma-color`)
-
-The window is always-on-top and shows only the captions on a solid background so you can chroma-key it. Your camera is used only by the app; capture the app window in OBS, not the camera itself.
+The window shows **your camera + captions** in one view. Only the app uses your camera, so you need just one source in OBS (no second camera, no Chroma Key).
 
 Full guide: **[OBS_SETUP.md](OBS_SETUP.md)**
 
@@ -152,13 +153,21 @@ Full guide: **[OBS_SETUP.md](OBS_SETUP.md)**
 
 ## Configuration
 
-Main settings are at the top of `face_captions.py`:
+Main settings are in **`config.json`** (and some at the top of `face_captions.py`):
 
-- `CAMERA_INDEX` – Webcam device index
-- `CAPTION_FONT_SIZE`, `CAPTION_MAX_WIDTH` – Text size and width
-- `CAPTION_SCALE_MIN`, `CAPTION_SCALE_MAX` – Size limits for +/-
-- `CAPTION_TIMEOUT_SEC` – How long captions stay on screen
-- `DISPLAY_SIZE` – Internal display size (e.g. 1280×720)
+| Option | Description |
+|--------|-------------|
+| **`camera_index`** | Webcam device index (0, 1, 2…). |
+| **`mic_input_device_index`** | Microphone for speech-to-text: `null` = default, or a number (run `python list_mics.py` for indices). |
+| **`caption_font_size`**, **`caption_max_width`** | Text size and max width. |
+| **`caption_style`** | `"minecraft"` (default) or `"cyberpunk"` – Cyberpunk 2077 style: chamfered corners, neon cyan border, scan lines, text glow. |
+| **`cyberpunk_font`** | Font filename for Cyberpunk style (e.g. `"Rajdhani-Regular.ttf"`, `"Orbitron-Regular.ttf"`). Place `.ttf` in project root or `fonts/`. `null` = default search. |
+| **`chroma_color`** | For OBS mode: `"green"`, `"blue"`, or `"magenta"`. |
+| **`show_face_box`** | Draw face bounding box. |
+| **`speech_bubble_tail`**, **`caption_history_lines`** | Caption behavior. |
+| **`obs_mode_default_size`** | Default window size in OBS mode (e.g. `"1280x720"`). |
+
+In `face_captions.py`: `CAPTION_TIMEOUT_SEC`, `DISPLAY_SIZE`, etc.
 
 Optional `.env` (in project folder):
 
@@ -177,11 +186,14 @@ Optional `.env` (in project folder):
 ├── download_vosk_model.py # One-time Vosk model download
 ├── download_face_landmarker_model.py  # One-time face model download
 ├── list_mics.py           # List microphone devices
+├── config.json            # Settings (camera, mic, caption style, fonts)
+├── obs_window.json       # OBS window position (auto-saved)
 ├── OBS_SETUP.md           # OBS setup guide
 ├── requirements.txt
 ├── .env                   # Optional: DEEPGRAM_API_KEY, etc.
 ├── models/                # Face (and optional) models
-└── Minecraft.ttf          # Optional font
+├── fonts/                 # Optional: Minecraft.ttf, Rajdhani-Regular.ttf, etc.
+└── *.ttf                  # Optional fonts in project root
 ```
 
 ---

@@ -10,23 +10,20 @@ python face_captions.py --obs-mode
 
 You'll see:
 
-- Green screen window
-- Captions floating where your face would be
+- A window showing **your camera + captions** (one window, one camera)
+- Captions floating above your face
 - Window always stays on top
 
 ### 2. Add to OBS
 
-1. Open OBS Studio
-2. **Add Source:** Click **+** in Sources → **Window Capture**
-3. Name it "Face Captions"
-4. Select the Python window: "Face captions..."
-5. **Remove Green Screen:** Right-click the source → **Filters** → **+** → **Chroma Key**
-   - Color: **Green**
-   - Similarity: 400–500
-   - Smoothness: 80–100
-6. **Position** the source in the OBS preview (drag/resize as needed)
+**Only the app uses your camera** — use a single source in OBS:
 
-Captions will follow your face automatically.
+1. Open OBS Studio
+2. Click **+** in Sources → **Window Capture**
+3. Name it "Face Captions" and select the Python window: "Face captions (Q=quit...)" or similar.
+4. **Position** the source in the OBS preview (drag/resize as needed).
+
+You’ll see: your **face + captions** in one shot. No second camera and no Chroma Key needed.
 
 ### 3. Start Streaming
 
@@ -41,16 +38,10 @@ You're done. The captions:
 
 ## Advanced Options
 
-### Smaller window
+### Window size (default 1280×720)
 
 ```bash
 python face_captions.py --obs-mode --window-size 800x600
-```
-
-### Different chroma color (blue or magenta)
-
-```bash
-python face_captions.py --obs-mode --chroma-color blue
 ```
 
 ### Hotkeys (while the app window is focused)
@@ -69,18 +60,17 @@ python face_captions.py --obs-mode --chroma-color blue
 
 | Issue | Fix |
 |--------|-----|
-| Green shows through caption | Increase Chroma Key **Similarity** in OBS |
 | Caption is cut off | Use a larger window: `--window-size 1920x1080` |
 | Captions lag | Close other apps; press **D** to check FPS |
 | No speech detected | Check mic permissions and that the app can use the microphone |
-| Camera not in OBS | Don’t add the camera in OBS. Use **Window Capture** on the face_captions window so the camera is only used by the app. |
+| Black or no video in OBS | Make sure the Face Captions window is not minimized; select the correct window in Window Capture (e.g. "Face captions (Q=quit...)"). |
 
 ---
 
 ## Testing Checklist
 
-1. **Basic:** Run `python face_captions.py --obs-mode` → green window, caption "..."
+1. **Basic:** Run `python face_captions.py --obs-mode` → window shows your face + caption "..."
 2. **Face tracking:** Move left/right/up/down → caption follows
 3. **Speech:** Speak → caption appears; stop → caption fades after a few seconds
-4. **OBS:** Window Capture finds the window; Chroma Key removes green; caption is readable
+4. **OBS:** Window Capture shows your face + captions in one source
 5. **Performance:** Press **D** → FPS around 28–30, frame time &lt; 30 ms

@@ -91,7 +91,7 @@ FACE_DETECT_SCALE = 0.28
 FACE_DETECT_EVERY_N = 6
 FACE_SMOOTH = 0.18
 MAX_CAPTION_LINES = 2
-REVEAL_CHARS_PER_FRAME = 999
+REVEAL_CHARS_PER_FRAME = 9999  # Effectively instant: show full caption as soon as STT delivers (smoother, faster)
 CAPTION_BG_COLOR = (45, 42, 34, 230)
 CAPTION_BG_PADDING = 12
 CAPTION_BORDER_LIGHT = (90, 85, 72, 255)
@@ -116,7 +116,8 @@ EMOTION_COLORS = {
 SHOW_FACE_BOX = False
 SPEECH_BUBBLE_TAIL = True
 CAPTION_HISTORY_LINES = 2
-FADE_IN_FRAMES = 1
+FADE_IN_FRAMES = 2
+CAPTION_POS_SMOOTH = 0.28
 EMOTION_HOLD_FRAMES = 3
 TRANSLATION_DEST = "es"
 
@@ -134,6 +135,39 @@ def get_minecraft_font(size: int):
                     return ImageFont.truetype(path, size)
                 except Exception:
                     pass
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def get_cyberpunk_font(size: int, preferred_path: str = None):
+    """Load font for Cyberpunk style. Use cyberpunk_font from config.json, or fallback to Rajdhani/Orbitron."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs = [script_dir, FONT_DIR]
+    if preferred_path:
+        candidates = [preferred_path] if os.path.isabs(preferred_path) else [os.path.join(d, preferred_path) for d in search_dirs]
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    pass
+    names = ["Rajdhani-Regular.ttf", "Rajdhani-Medium.ttf", "Rajdhani-SemiBold.ttf", "Orbitron-Regular.ttf", "Cyberpunk-Regular.ttf", "ShareTechMono-Regular.ttf", "OCR-A.ttf", "OCRA.ttf"]
+    for d in search_dirs:
+        for name in names:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    pass
+    font_names = ["Consolas", "Segoe UI", "Arial", "arial.ttf"]
+    for name in font_names:
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            pass
     try:
         return ImageFont.truetype("arial.ttf", size)
     except Exception:
@@ -241,6 +275,108 @@ def render_caption_pil(
     return np.array(img)
 
 
+# Cyberpunk 2077 style: dark bg, neon cyan/magenta, chamfered corners, scan lines
+CYBERPUNK_BG = (10, 10, 10, 153)  # #0A0A0A ~60% opacity
+CYBERPUNK_BORDER = (0, 215, 242)  # #02d7f2 cyan
+CYBERPUNK_GLOW = (0, 255, 255)    # #00FFFF bright cyan
+CYBERPUNK_TEXT = (255, 255, 255)
+CYBERPUNK_ACCENT_MAGENTA = (255, 0, 255)
+
+
+def _draw_chamfered_box(draw, x0, y0, w, h, chamfer: int, fill, outline=None, width=1):
+    """Draw a box with chamfered (cut) corners, CP2077 style."""
+    c = min(chamfer, w // 4, h // 4)
+    pts = [
+        (x0 + c, y0), (x0 + w - c, y0),
+        (x0 + w, y0 + c), (x0 + w, y0 + h - c),
+        (x0 + w - c, y0 + h), (x0 + c, y0 + h),
+        (x0, y0 + h - c), (x0, y0 + c),
+    ]
+    try:
+        draw.polygon(pts, fill=fill, outline=outline, width=width)
+    except TypeError:
+        draw.polygon(pts, fill=fill, outline=outline)
+
+
+def render_caption_pil_cyberpunk(
+    text: str,
+    font_size: int,
+    bg_color: tuple = None,
+    speech_bubble: bool = True,
+    max_width: int = None,
+    padding: int = None,
+    font_path: str = None,
+) -> np.ndarray:
+    """Render caption in authentic Cyberpunk 2077 style: chamfered box, neon cyan border, scan lines, text glow."""
+    if not text or not HAS_PIL:
+        return None
+    font = get_cyberpunk_font(font_size, preferred_path=font_path)
+    use_max_width = max_width if max_width is not None else CAPTION_MAX_WIDTH
+    pad = padding if padding is not None else CAPTION_BG_PADDING
+    if "\n" in text:
+        all_lines = []
+        for phrase in text.split("\n"):
+            phrase = (phrase or "").strip()
+            if phrase:
+                all_lines.extend(_wrap_text(phrase, font, use_max_width))
+        max_total = 2
+        lines = all_lines[-max_total:]
+    else:
+        lines = _wrap_text(text, font, use_max_width)
+        if len(lines) > MAX_CAPTION_LINES:
+            lines = lines[-MAX_CAPTION_LINES:]
+    line_height = font_size + 4
+    try:
+        max_w = max(font.getbbox(line)[2] - font.getbbox(line)[0] for line in lines)
+    except Exception:
+        max_w = use_max_width
+    total_w = max_w + 2 * pad
+    box_h = line_height * len(lines) + 2 * pad
+    tail_h = max(6, 10 * font_size // 52) if speech_bubble else 0
+    total_h = box_h + tail_h
+    chamfer = max(6, font_size // 8)
+    fill_color = bg_color if bg_color is not None else CYBERPUNK_BG
+    img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    border_rgb = CYBERPUNK_BORDER
+    _draw_chamfered_box(draw, 0, 0, total_w, box_h, chamfer, fill_color, outline=(*border_rgb, 255), width=2)
+    accent_y = chamfer + 2
+    if accent_y < box_h - chamfer - 2:
+        draw.line([(chamfer + 4, accent_y), (total_w - chamfer - 4, accent_y)], fill=(255, 0, 255, 180), width=1)
+    if speech_bubble and tail_h:
+        cx = total_w // 2
+        tail_w = 12
+        draw.polygon(
+            [(cx - tail_w, box_h - 1), (cx + tail_w, box_h - 1), (cx, total_h - 1)],
+            fill=fill_color,
+            outline=None,
+        )
+        draw.line([(cx - tail_w, box_h - 1), (cx, total_h - 1)], fill=border_rgb, width=2)
+        draw.line([(cx + tail_w, box_h - 1), (cx, total_h - 1)], fill=border_rgb, width=2)
+    for i, line in enumerate(lines):
+        y = pad + i * line_height
+        for r in [3, 2, 1]:
+            alpha = 24 - r * 6
+            draw.text((pad - r, y), line, font=font, fill=(0, 255, 255, alpha))
+            draw.text((pad + r, y), line, font=font, fill=(0, 255, 255, alpha))
+            draw.text((pad, y - r), line, font=font, fill=(0, 255, 255, alpha))
+            draw.text((pad, y + r), line, font=font, fill=(0, 255, 255, alpha))
+        draw.text((pad + 1, y + 1), line, font=font, fill=(0, 0, 0, 200))
+        draw.text((pad, y), line, font=font, fill=CYBERPUNK_TEXT)
+    arr = np.array(img)
+    scan_alpha = 4
+    for row in range(0, total_h, 6):
+        if row < arr.shape[0]:
+            arr[row, :, 3] = np.minimum(arr[row, :, 3].astype(np.int32) + scan_alpha, 255)
+    rng = np.random.default_rng(42)
+    for _ in range(min(1, total_h // 80)):
+        row = int(rng.integers(2, max(3, total_h - 2)))
+        shift = int(rng.choice([-1, 1]))
+        if 0 <= row < total_h:
+            arr[row, :, :] = np.roll(arr[row, :, :], shift, axis=0)
+    return arr
+
+
 def overlay_caption_on_frame(
     frame: np.ndarray,
     caption_rgba: np.ndarray,
@@ -282,7 +418,7 @@ class FaceKalmanTracker:
         self.kf.measurementMatrix = np.array([
             [1, 0, 0, 0], [0, 1, 0, 0]
         ], dtype=np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.003
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.002
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.25
         self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.25
         self.initialized = False
@@ -483,6 +619,9 @@ def load_config():
         "speech_bubble_tail": True,
         "caption_history_lines": 2,
         "chroma_color": "green",
+        "mic_input_device_index": None,
+        "caption_style": "minecraft",
+        "cyberpunk_font": None,
     }
     if os.path.exists(config_path):
         try:
@@ -611,9 +750,9 @@ def main():
         camera_index = find_camera() if cfg_cam == "auto" else int(cfg_cam)
 
     PERFORMANCE_PRESETS = {
-        "high": {"display_size": (1920, 1080), "detect_interval_tracking": 8, "caption_cache_size": 20, "enhance_frame": True},
-        "balanced": {"display_size": (1280, 720), "detect_interval_tracking": 8, "caption_cache_size": 20, "enhance_frame": True},
-        "low": {"display_size": (960, 540), "detect_interval_tracking": 12, "caption_cache_size": 10, "enhance_frame": False},
+        "high": {"display_size": (1920, 1080), "detect_interval_tracking": 6, "caption_cache_size": 20, "enhance_frame": True},
+        "balanced": {"display_size": (1280, 720), "detect_interval_tracking": 6, "caption_cache_size": 20, "enhance_frame": True},
+        "low": {"display_size": (960, 540), "detect_interval_tracking": 10, "caption_cache_size": 10, "enhance_frame": False},
     }
     perf_mode = args.performance_mode if args.performance_mode != "auto" else "balanced"
     perf = PERFORMANCE_PRESETS.get(perf_mode, PERFORMANCE_PRESETS["balanced"])
@@ -674,7 +813,10 @@ def main():
     time.sleep(0.3)
 
     text_queue = queue.Queue()
-    stt = StreamingSTT(text_queue) if HAS_STT else None
+    mic_index = config.get("mic_input_device_index")
+    if mic_index is not None and not isinstance(mic_index, int):
+        mic_index = None
+    stt = StreamingSTT(text_queue, input_device_index=mic_index) if HAS_STT else None
     if HAS_STT and stt.start():
         mode = get_caption_mode()
         engine = getattr(stt, "_engine", "batch")
@@ -705,6 +847,9 @@ def main():
     show_face_box = SHOW_FACE_BOX
     show_speech_tail = SPEECH_BUBBLE_TAIL
     caption_history_lines = CAPTION_HISTORY_LINES
+    caption_style = config.get("caption_style", "minecraft")
+    if caption_style not in ("minecraft", "cyberpunk"):
+        caption_style = "minecraft"
     fade_in_frames = FADE_IN_FRAMES
     apply_color_filter = False
     translate_enabled = False
@@ -717,6 +862,7 @@ def main():
     MAX_CAPTION_CACHE_SIZE = caption_cache_size
     last_caption_scale = 1.0
     last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
+    smooth_caption_x, smooth_caption_y = None, None
     fps_history = []
     last_fps_time = time.time()
 
@@ -730,6 +876,7 @@ def main():
     last_debug_time = time.time()
 
     print("Performance: {} ({}x{})".format(perf_mode, disp_w_cfg, disp_h_cfg))
+    print("Caption style: {} (change in config.json: minecraft | cyberpunk)".format(caption_style))
     print("Caption size: + / - keys (0=100% 1=min 9=max, D=debug)")
     face_landmarker_mp = None
     if HAS_FACE_MESH and create_face_landmarker:
@@ -914,7 +1061,7 @@ def main():
         face_bbox = last_face_bbox
 
         try:
-            max_items = 10
+            max_items = 60  # Drain STT queue aggressively for real-time partials
             items_processed = 0
             new_final = False
             while items_processed < max_items:
@@ -951,6 +1098,7 @@ def main():
             reveal_len = target_len
         else:
             reveal_len = min(reveal_len + REVEAL_CHARS_PER_FRAME, target_len)
+        # Show full caption immediately for streaming (no typewriter delay)
         displayed_caption = current_caption[:reveal_len]
 
         if translate_enabled and HAS_TRANSLATE and _translator and last_final and last_final != last_final_translated:
@@ -997,21 +1145,32 @@ def main():
             last_caption_text = display_text
             last_caption_scale = scale_key
             text_hash = hash(display_text[:50]) if len(display_text) > 30 else display_text
-            cache_key = (emotion, show_speech_tail, scale_key, text_hash)
+            cyberpunk_font = config.get("cyberpunk_font") or ""
+            cache_key = (caption_style, cyberpunk_font, emotion, show_speech_tail, scale_key, text_hash)
             if cache_key in caption_cache and caption_cache[cache_key][1] == display_text:
                 last_caption_render = caption_cache[cache_key][0]
                 caption_cache.move_to_end(cache_key)
             else:
-                color_name = EMOTIONS.get(emotion, EMOTIONS["neutral"])[1]
-                bg_color = EMOTION_COLORS.get(color_name, CAPTION_BG_COLOR)
-                last_caption_render = render_caption_pil(
-                    display_text,
-                    scaled_font,
-                    bg_color=bg_color,
-                    speech_bubble=show_speech_tail,
-                    max_width=scaled_max_width,
-                    padding=scaled_padding,
-                )
+                if caption_style == "cyberpunk":
+                    last_caption_render = render_caption_pil_cyberpunk(
+                        display_text,
+                        scaled_font,
+                        speech_bubble=show_speech_tail,
+                        max_width=scaled_max_width,
+                        padding=scaled_padding,
+                        font_path=config.get("cyberpunk_font"),
+                    )
+                else:
+                    color_name = EMOTIONS.get(emotion, EMOTIONS["neutral"])[1]
+                    bg_color = EMOTION_COLORS.get(color_name, CAPTION_BG_COLOR)
+                    last_caption_render = render_caption_pil(
+                        display_text,
+                        scaled_font,
+                        bg_color=bg_color,
+                        speech_bubble=show_speech_tail,
+                        max_width=scaled_max_width,
+                        padding=scaled_padding,
+                    )
                 if last_caption_render is not None:
                     if len(caption_cache) >= MAX_CAPTION_CACHE_SIZE:
                         caption_cache.popitem(last=False)
@@ -1038,8 +1197,6 @@ def main():
         else:
             cx = int(face_center_x)
             ty = int(face_top_y)
-        caption_x = cx
-        caption_y = ty - CAPTION_OFFSET_ABOVE_HEAD
         if last_caption_render is not None:
             cw = last_caption_render.shape[1]
             ch = last_caption_render.shape[0]
@@ -1047,15 +1204,24 @@ def main():
             if face_bbox is not None:
                 _, _, _, fh = face_bbox
                 dynamic_offset = max(CAPTION_OFFSET_ABOVE_HEAD, int(fh * 0.3))
-            caption_y = ty - ch - dynamic_offset
-            caption_y = max(0, caption_y) + caption_offset_y
-            caption_x = max(0, min(cx - cw // 2, w - cw)) + caption_offset_x
+            target_x = max(0.0, min(float(cx - cw // 2), float(w - cw))) + caption_offset_x
+            target_y = max(0.0, float(ty - ch - dynamic_offset)) + caption_offset_y
+            if smooth_caption_x is None:
+                smooth_caption_x, smooth_caption_y = target_x, target_y
+            else:
+                smooth_caption_x += (target_x - smooth_caption_x) * CAPTION_POS_SMOOTH
+                smooth_caption_y += (target_y - smooth_caption_y) * CAPTION_POS_SMOOTH
+                smooth_caption_x = max(0, min(smooth_caption_x, w - cw))
+                smooth_caption_y = max(0, min(smooth_caption_y, h - ch))
+            caption_x = int(round(smooth_caption_x))
+            caption_y = int(round(smooth_caption_y))
             frame = overlay_caption_on_frame(
                 frame, last_caption_render, caption_x, caption_y, alpha_mult=alpha_mult
             )
             last_caption_x, last_caption_y, last_caption_w, last_caption_h = caption_x, caption_y, cw, ch
         else:
             last_caption_x, last_caption_y, last_caption_w, last_caption_h = None, None, None, None
+            smooth_caption_x, smooth_caption_y = None, None
         if show_face_box and face_bbox and not obs_mode:
             x, y, bw, bh = face_bbox
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
@@ -1065,7 +1231,11 @@ def main():
             frame_count += 1
         if obs_mode:
             w_obs, h_obs = OBS_WINDOW_SIZE
-            display_frame = np.full((h_obs, w_obs, 3), obs_chroma_bgr, dtype=np.uint8)
+            # Show camera + captions in one window so OBS needs only one source (no second camera)
+            if frame is not None and frame.size > 0:
+                display_frame = cv2.resize(frame, (w_obs, h_obs), interpolation=cv2.INTER_LINEAR)
+            else:
+                display_frame = np.full((h_obs, w_obs, 3), obs_chroma_bgr, dtype=np.uint8)
             if debug_mode:
                 for i in range(0, w_obs, 100):
                     cv2.line(display_frame, (i, 0), (i, h_obs), tuple(max(0, c - 55) for c in obs_chroma_bgr), 1)

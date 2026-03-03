@@ -1,10 +1,13 @@
 {
-  "camera_index": 0,
+  "camera_index": 1,
   "caption_font_size": 52,
   "caption_max_width": 620,
   "obs_mode_default_size": "1280x720",
   "show_face_box": false,
   "speech_bubble_tail": true,
   "caption_history_lines": 2,
-  "chroma_color": "green"
+  "chroma_color": "green",
+  "mic_input_device_index": 1,
+  "caption_style": "cyberpunk",
+  "cyberpunk_font": "Rajdhani-Regular.ttf"
 }

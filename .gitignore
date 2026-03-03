@@ -33,7 +33,6 @@ env/
 models/
 vosk-model/
 *.zip
-
 # IDE / editor
 .idea/
 .vscode/

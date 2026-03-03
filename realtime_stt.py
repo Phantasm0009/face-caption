@@ -84,9 +84,11 @@ class StreamingSTT:
     Prefers: faster-whisper > Vosk > batch Google. Optional: Deepgram if API key set.
     """
 
-    def __init__(self, result_queue: queue.Queue, sample_rate: int = 16000):
+    def __init__(self, result_queue: queue.Queue, sample_rate: int = 16000, input_device_index=None):
         self.result_queue = result_queue
         self.sample_rate = sample_rate
+        # Microphone device index (None = default). Also set in config.json as "mic_input_device_index". Run list_mics.py to see indices.
+        self.input_device_index = input_device_index
         self.running = False
         self._thread = None
         self._use_faster_whisper = False
@@ -109,7 +111,7 @@ class StreamingSTT:
                     print("STT: Using Deepgram API (live streaming)")
                     print("     If no speech appears, check:")
                     print("     1. Microphone permissions")
-                    print("     2. Default input device (set DEEPGRAM_INPUT_DEVICE_INDEX if needed)")
+                    print("     2. Wrong mic? Set mic_input_device_index in config.json (run list_mics.py for indices)")
                     print("     3. API key validity (check Deepgram console)")
                 except Exception as e:
                     print("STT: Deepgram initialization failed ({0})".format(type(e).__name__))
@@ -156,7 +158,7 @@ class StreamingSTT:
             self._thread.join(timeout=2.0)
 
     def _run_faster_whisper(self):
-        """Chunked transcription (1.2s chunks, 75% overlap) for lower latency."""
+        """Chunked transcription: shorter chunks + 50% overlap for faster, smoother subtitles."""
         p = pyaudio.PyAudio()
         try:
             stream = p.open(
@@ -164,14 +166,16 @@ class StreamingSTT:
                 channels=1,
                 rate=self.sample_rate,
                 input=True,
+                input_device_index=self.input_device_index,
                 frames_per_buffer=4800,
             )
         except Exception:
             return
-        chunk_duration = 1.2
+        chunk_duration = 0.7   # Shorter = lower latency (was 1.2s)
         samples_per_chunk = int(self.sample_rate * chunk_duration)
-        read_size = 2400
+        read_size = 1600
         audio_buffer = []
+        advance = max(1, samples_per_chunk // 2)  # 50% overlap = output every ~0.35s of new audio
         while self.running and stream.is_active():
             try:
                 data = stream.read(read_size, exception_on_overflow=False)
@@ -182,7 +186,7 @@ class StreamingSTT:
                 if len(audio_buffer) < samples_per_chunk:
                     continue
                 chunk = np.array(audio_buffer[:samples_per_chunk], dtype=np.float32)
-                audio_buffer = audio_buffer[samples_per_chunk // 4:]
+                audio_buffer = audio_buffer[advance:]
                 segments, _ = self._model.transcribe(
                     chunk,
                     beam_size=1,
@@ -231,14 +235,15 @@ class StreamingSTT:
         if not self._dg_client:
             return
         p = pyaudio.PyAudio()
-        # Optional: set DEEPGRAM_INPUT_DEVICE_INDEX if default mic is wrong (e.g. on Windows)
-        input_device = None
-        try:
-            idx = os.environ.get("DEEPGRAM_INPUT_DEVICE_INDEX")
-            if idx is not None:
-                input_device = int(idx)
-        except ValueError:
-            pass
+        # Mic: config.json "mic_input_device_index" or env DEEPGRAM_INPUT_DEVICE_INDEX (run list_mics.py for indices)
+        input_device = self.input_device_index
+        if input_device is None:
+            try:
+                idx = os.environ.get("DEEPGRAM_INPUT_DEVICE_INDEX")
+                if idx is not None:
+                    input_device = int(idx)
+            except ValueError:
+                pass
         try:
             stream = p.open(
                 format=pyaudio.paInt16,
@@ -355,12 +360,13 @@ class StreamingSTT:
                 channels=1,
                 rate=self.sample_rate,
                 input=True,
+                input_device_index=self.input_device_index,
                 frames_per_buffer=4096,
             )
         except Exception:
             return
-        # Small chunks = partials every ~75ms so text appears instantly as you speak
-        chunk_samples = 1200
+        # Small chunks = partials every ~50ms for faster, smoother live text
+        chunk_samples = 800
         while self.running and stream.is_active():
             try:
                 data = stream.read(chunk_samples, exception_on_overflow=False)
@@ -391,7 +397,10 @@ class StreamingSTT:
         chunk_sec = 0.6  # More context = better accuracy (still responsive)
         mic = None
         try:
-            mic = sr.Microphone(sample_rate=16000)
+            kwargs = {"sample_rate": 16000}
+            if self.input_device_index is not None:
+                kwargs["device_index"] = self.input_device_index
+            mic = sr.Microphone(**kwargs)
             with mic as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.8)
         except Exception:
